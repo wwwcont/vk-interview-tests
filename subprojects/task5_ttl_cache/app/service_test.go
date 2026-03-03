@@ -7,10 +7,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"vk-interview-tests/subprojects/task5_ttl_cache/domain"
 )
 
 func TestSingleflight(t *testing.T) {
-	s := New(10)
+	s := New(domain.Config{MaxEntries: 10})
 	var n int32
 	l := func(context.Context) (any, error) {
 		atomic.AddInt32(&n, 1)
@@ -28,7 +30,7 @@ func TestSingleflight(t *testing.T) {
 	}
 }
 func TestTTLAndEviction(t *testing.T) {
-	s := New(2)
+	s := New(domain.Config{MaxEntries: 2})
 	s.Set("a", 1, time.Second)
 	s.Set("b", 2, time.Second)
 	_, _ = s.Get("a")
@@ -43,7 +45,7 @@ func TestTTLAndEviction(t *testing.T) {
 	}
 }
 func TestStaleOnError(t *testing.T) {
-	s := New(2)
+	s := New(domain.Config{MaxEntries: 2, StaleGrace: 2 * time.Second})
 	s.Set("k", "old", 10*time.Millisecond)
 	time.Sleep(15 * time.Millisecond)
 	v, err := s.GetOrLoad(context.Background(), "k", time.Second, func(context.Context) (any, error) { return nil, errors.New("fail") })

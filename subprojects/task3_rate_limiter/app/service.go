@@ -4,17 +4,14 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"vk-interview-tests/subprojects/task3_rate_limiter/domain"
 )
 
 /*
-Усложнение задачи 3: per-key token bucket + blocking Acquire + idle TTL + cleanup budget.
-Постановка: независимые лимиты по ключам, Allow неблокирующий, Acquire ждёт токен или ctx.Done.
-Дополнительно: lazy-cleanup выполняется с ограничением на число удалений за вызов,
-чтобы единичный запрос не деградировал при большом числе ключей.
-Алгоритм: map[key]bucket под mutex, refill через time.Now, Acquire через timer-loop.
+DDD-версия задачи 3.
+Domain задаёт контракт + константу cleanup budget, application реализует механику token bucket.
 */
-
-const CleanupBudget = 32
 
 type bucket struct {
 	tok        float64
@@ -22,10 +19,11 @@ type bucket struct {
 }
 
 type Service struct {
-	mu          sync.Mutex
-	rate, burst float64
-	ttl         time.Duration
-	m           map[string]*bucket
+	mu            sync.Mutex
+	rate, burst   float64
+	ttl           time.Duration
+	cleanupBudget int
+	m             map[string]*bucket
 }
 
 func New(rate float64, burst int, ttl time.Duration) *Service {
@@ -38,8 +36,9 @@ func New(rate float64, burst int, ttl time.Duration) *Service {
 	if ttl < 0 {
 		ttl = 0
 	}
-	return &Service{rate: rate, burst: float64(burst), ttl: ttl, m: map[string]*bucket{}}
+	return &Service{rate: rate, burst: float64(burst), ttl: ttl, cleanupBudget: domain.DefaultCleanupBudget, m: map[string]*bucket{}}
 }
+
 func (s *Service) Allow(key string) bool {
 	now := time.Now()
 	s.mu.Lock()
@@ -54,7 +53,11 @@ func (s *Service) Allow(key string) bool {
 	b.tok--
 	return true
 }
+
 func (s *Service) Acquire(ctx context.Context, key string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
 		now := time.Now()
 		s.mu.Lock()
@@ -80,6 +83,7 @@ func (s *Service) Acquire(ctx context.Context, key string) error {
 		}
 	}
 }
+
 func (s *Service) get(key string, now time.Time) *bucket {
 	if b, ok := s.m[key]; ok {
 		return b
@@ -126,7 +130,7 @@ func (s *Service) cleanup(now time.Time) {
 		if now.Sub(b.seen) > s.ttl {
 			delete(s.m, k)
 			n++
-			if n >= CleanupBudget {
+			if n >= s.cleanupBudget {
 				break
 			}
 		}

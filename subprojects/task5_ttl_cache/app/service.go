@@ -5,17 +5,14 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"vk-interview-tests/subprojects/task5_ttl_cache/domain"
 )
 
 /*
-Усложнение задачи 5: TTL cache + LRU limit + singleflight + stale-on-error.
-Постановка: cache с ограничением размера и дедупликацией loader по ключу.
-Дополнение: если значение истекло, но loader вернул ошибку, можно вернуть stale
-(если не старше StaleGrace), что часто практично для деградационных сценариев.
-Алгоритм: map+LRU под mutex, inflight map для singleflight, leader/follower схема.
+DDD-версия задачи 5.
+Domain держит контракт и конфиг, app реализует LRU+TTL+singleflight и stale-on-error.
 */
-
-const StaleGrace = 2 * time.Second
 
 type entry struct {
 	key  string
@@ -31,18 +28,22 @@ type call struct {
 
 type Service struct {
 	mu    sync.Mutex
-	max   int
+	cfg   domain.Config
 	items map[string]*entry
 	lru   *list.List
 	in    map[string]*call
 }
 
-func New(max int) *Service {
-	if max <= 0 {
-		max = 1
+func New(cfg domain.Config) *Service {
+	if cfg.MaxEntries <= 0 {
+		cfg.MaxEntries = 1
 	}
-	return &Service{max: max, items: map[string]*entry{}, lru: list.New(), in: map[string]*call{}}
+	if cfg.StaleGrace <= 0 {
+		cfg.StaleGrace = domain.DefaultStaleGrace
+	}
+	return &Service{cfg: cfg, items: map[string]*entry{}, lru: list.New(), in: map[string]*call{}}
 }
+
 func (s *Service) Get(key string) (any, bool) {
 	now := time.Now()
 	s.mu.Lock()
@@ -63,6 +64,7 @@ func (s *Service) Set(key string, value any, ttl time.Duration) {
 	defer s.mu.Unlock()
 	s.set(key, value, time.Now().Add(ttl))
 }
+
 func (s *Service) GetOrLoad(ctx context.Context, key string, ttl time.Duration, loader func(context.Context) (any, error)) (any, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -78,7 +80,7 @@ func (s *Service) GetOrLoad(ctx context.Context, key string, ttl time.Duration, 
 			s.mu.Unlock()
 			return v, nil
 		}
-		if now.Before(e.exp.Add(StaleGrace)) {
+		if now.Before(e.exp.Add(s.cfg.StaleGrace)) {
 			stale, staleOK = e.v, true
 		} else {
 			s.remove(e)
@@ -108,6 +110,7 @@ func (s *Service) GetOrLoad(ctx context.Context, key string, ttl time.Duration, 
 	}
 	return v, err
 }
+
 func (s *Service) getCall(key string) (*call, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,7 +130,7 @@ func (s *Service) set(k string, v any, exp time.Time) {
 	}
 	el := s.lru.PushFront(k)
 	s.items[k] = &entry{key: k, v: v, exp: exp, elem: el}
-	for len(s.items) > s.max {
+	for len(s.items) > s.cfg.MaxEntries {
 		bk := s.lru.Back().Value.(string)
 		s.remove(s.items[bk])
 	}

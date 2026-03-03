@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
@@ -10,27 +9,13 @@ import (
 )
 
 /*
-Усложнение задачи 4: rolling window + half-open probes + minRequestsToTrip.
-Постановка: breaker открывается не просто по errorRate, а только когда в окне
-накопилось минимум MinRequestsToTrip запросов. Это уменьшает ложные срабатывания
-на старте. В half-open ограничиваем параллельные probe и восстанавливаемся при success.
-Алгоритм: before() решает доступ, fn исполняется вне lock, after() обновляет статистику.
+DDD-версия задачи 4.
+Конфиг/ошибки/тип состояния вынесены в домен. Приложение управляет переходами и rolling-метрикой.
 */
-
-var ErrOpen = errors.New("breaker open")
-
-type Config struct {
-	WindowSize        int
-	ErrorThreshold    float64
-	ResetTimeout      time.Duration
-	MaxProbe          int
-	MinRequestsToTrip int
-	IsFailure         func(error) bool
-}
 
 type Service struct {
 	mu               sync.Mutex
-	cfg              Config
+	cfg              domain.Config
 	state            domain.State
 	openedAt         time.Time
 	win              []bool
@@ -38,7 +23,7 @@ type Service struct {
 	probeIn, probeOK int
 }
 
-func New(cfg Config) *Service {
+func New(cfg domain.Config) *Service {
 	if cfg.WindowSize <= 0 {
 		cfg.WindowSize = 10
 	}
@@ -59,6 +44,7 @@ func New(cfg Config) *Service {
 	}
 	return &Service{cfg: cfg, state: domain.Closed, win: make([]bool, cfg.WindowSize)}
 }
+
 func (s *Service) Execute(ctx context.Context, fn func(context.Context) error) error {
 	if fn == nil {
 		return nil
@@ -70,6 +56,7 @@ func (s *Service) Execute(ctx context.Context, fn func(context.Context) error) e
 	s.after(err)
 	return err
 }
+
 func (s *Service) State() domain.State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -78,6 +65,7 @@ func (s *Service) State() domain.State {
 	}
 	return s.state
 }
+
 func (s *Service) before() error {
 	now := time.Now()
 	s.mu.Lock()
@@ -87,22 +75,23 @@ func (s *Service) before() error {
 	}
 	switch s.state {
 	case domain.Open:
-		return ErrOpen
+		return domain.ErrBreakerOpen
 	case domain.HalfOpen:
 		if s.probeIn >= s.cfg.MaxProbe {
-			return ErrOpen
+			return domain.ErrBreakerOpen
 		}
 		s.probeIn++
 	}
 	return nil
 }
+
 func (s *Service) after(err error) {
-	fail := s.cfg.IsFailure(err)
+	failed := s.cfg.IsFailure(err)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch s.state {
 	case domain.Closed:
-		s.push(fail)
+		s.push(failed)
 		if s.cnt < s.cfg.MinRequestsToTrip {
 			return
 		}
@@ -113,7 +102,7 @@ func (s *Service) after(err error) {
 		if s.probeIn > 0 {
 			s.probeIn--
 		}
-		if fail {
+		if failed {
 			s.toOpen()
 			return
 		}
@@ -123,6 +112,7 @@ func (s *Service) after(err error) {
 		}
 	}
 }
+
 func (s *Service) push(f bool) {
 	if s.cnt == len(s.win) {
 		if s.win[s.pos] {

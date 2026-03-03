@@ -10,7 +10,7 @@ import (
 )
 
 func TestTransitions(t *testing.T) {
-	b := New(Config{WindowSize: 4, MinRequestsToTrip: 4, ErrorThreshold: .5, ResetTimeout: 30 * time.Millisecond, MaxProbe: 1})
+	b := New(domain.Config{WindowSize: 4, MinRequestsToTrip: 4, ErrorThreshold: .5, ResetTimeout: 30 * time.Millisecond, MaxProbe: 1})
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("x") })
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("x") })
 	_ = b.Execute(context.Background(), func(context.Context) error { return nil })
@@ -29,8 +29,9 @@ func TestTransitions(t *testing.T) {
 		t.Fatal("want closed")
 	}
 }
+
 func TestPredicate(t *testing.T) {
-	b := New(Config{WindowSize: 2, MinRequestsToTrip: 2, ErrorThreshold: .5, IsFailure: func(err error) bool { return err != nil && err.Error() == "fatal" }})
+	b := New(domain.Config{WindowSize: 2, MinRequestsToTrip: 2, ErrorThreshold: .5, IsFailure: func(err error) bool { return err != nil && err.Error() == "fatal" }})
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("soft") })
 	_ = b.Execute(context.Background(), func(context.Context) error { return nil })
 	if b.State() != domain.Closed {

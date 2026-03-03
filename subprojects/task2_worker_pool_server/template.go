@@ -16,7 +16,7 @@ func NewMux(p domain.Pool) *http.ServeMux {
 		if r.URL.Query().Get("priority") == "high" {
 			prio = domain.High
 		}
-		err := p.Submit(r.Context(), prio, func(ctx context.Context) error { return nil })
+		err := p.Submit(r.Context(), prio, func(context.Context) error { return nil })
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusTooManyRequests)
 			return
@@ -25,3 +25,5 @@ func NewMux(p domain.Pool) *http.ServeMux {
 	})
 	return mux
 }
+
+func Run(addr string, p domain.Pool) error { return http.ListenAndServe(addr, NewMux(p)) }

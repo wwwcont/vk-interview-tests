@@ -10,3 +10,10 @@ type Cache interface {
 	Set(key string, value any, ttl time.Duration)
 	GetOrLoad(ctx context.Context, key string, ttl time.Duration, loader func(context.Context) (any, error)) (any, error)
 }
+
+type Config struct {
+	MaxEntries int
+	StaleGrace time.Duration
+}
+
+const DefaultStaleGrace = 2 * time.Second

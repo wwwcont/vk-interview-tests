@@ -23,3 +23,5 @@ func NewMux(l domain.Limiter) *http.ServeMux {
 	})
 	return mux
 }
+
+func Run(addr string, l domain.Limiter) error { return http.ListenAndServe(addr, NewMux(l)) }

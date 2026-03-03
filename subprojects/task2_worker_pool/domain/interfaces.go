@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 type Priority int
 
@@ -16,3 +19,7 @@ type Pool interface {
 	Resize(n int)
 	Close(ctx context.Context) error
 }
+
+var ErrPoolClosed = errors.New("pool closed")
+
+const DefaultQueueCapacity = 256

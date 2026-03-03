@@ -1,7 +1,6 @@
 package app
 
 import (
-	"errors"
 	"math"
 	"sync"
 	"time"
@@ -10,21 +9,10 @@ import (
 )
 
 /*
-Усложнённая задача 1 (в рамках интервью): Least-Load + latency EMA + error penalty.
-Постановка: выбрать healthy backend по минимальному score = inflight + latencyEMA + errorPenalty.
-Done() уменьшает inflight, обновляет latency EMA и слегка увеличивает penalty на ошибках
-(с мягким затуханием на успешных вызовах). Update() атомарно заменяет список backend.
-Алгоритм: mutex на краткие критические секции; Pick только выбирает и резервирует inflight,
-реальный Do вызывается снаружи; Done idempotent через sync.Once.
+DDD-версия задачи 1.
+Домен определяет интерфейсы, ошибки и дефолтные коэффициенты.
+Application-сервис реализует стратегию least-load + latency EMA + error penalty.
 */
-
-const (
-	latencyAlpha    = 0.2
-	penaltyOnError  = 1.0
-	penaltyRecovery = 0.15
-)
-
-var ErrNoHealthyBackend = errors.New("no healthy backend")
 
 type stat struct {
 	inflight               int64
@@ -35,6 +23,10 @@ type Service struct {
 	mu       sync.Mutex
 	backends []domain.Backend
 	stats    map[string]*stat
+
+	latencyAlpha    float64
+	penaltyOnError  float64
+	penaltyRecovery float64
 }
 
 type picked struct {
@@ -44,7 +36,12 @@ type picked struct {
 }
 
 func New(backends []domain.Backend) *Service {
-	s := &Service{stats: map[string]*stat{}}
+	s := &Service{
+		stats:           map[string]*stat{},
+		latencyAlpha:    domain.DefaultLatencyAlpha,
+		penaltyOnError:  domain.DefaultPenaltyOnError,
+		penaltyRecovery: domain.DefaultPenaltyRecovery,
+	}
 	s.Update(backends)
 	return s
 }
@@ -65,7 +62,7 @@ func (s *Service) Pick() (domain.Backend, domain.Picked, error) {
 		}
 	}
 	if chosen == nil {
-		return nil, nil, ErrNoHealthyBackend
+		return nil, nil, domain.ErrNoHealthyBackend
 	}
 	s.get(chosen.ID()).inflight++
 	return chosen, &picked{s: s, id: chosen.ID()}, nil
@@ -104,12 +101,12 @@ func (s *Service) done(id string, err error, latency time.Duration) {
 	if st.latencyEMA == 0 {
 		st.latencyEMA = l
 	} else {
-		st.latencyEMA = latencyAlpha*l + (1-latencyAlpha)*st.latencyEMA
+		st.latencyEMA = s.latencyAlpha*l + (1-s.latencyAlpha)*st.latencyEMA
 	}
 	if err != nil {
-		st.errPenalty += penaltyOnError
+		st.errPenalty += s.penaltyOnError
 	} else {
-		st.errPenalty = math.Max(0, st.errPenalty-penaltyRecovery)
+		st.errPenalty = math.Max(0, st.errPenalty-s.penaltyRecovery)
 	}
 }
 

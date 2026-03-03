@@ -24,3 +24,5 @@ func NewMux(c domain.Cache) *http.ServeMux {
 	})
 	return mux
 }
+
+func Run(addr string, c domain.Cache) error { return http.ListenAndServe(addr, NewMux(c)) }

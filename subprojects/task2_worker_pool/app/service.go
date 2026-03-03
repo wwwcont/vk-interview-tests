@@ -2,24 +2,15 @@ package app
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	"vk-interview-tests/subprojects/task2_worker_pool/domain"
 )
 
 /*
-Усложнение задачи 2: Dynamic Resize + Priority + Graceful Shutdown + bounded queue.
-Постановка: High приоритет выше Normal, Resize меняет число воркеров на лету,
-Close(ctx) дожидается принятых задач, Submit после Close -> ошибка.
-Дополнительно: ограниченная очередь (queueCap), чтобы не раздувать память.
-Алгоритм: 2 очереди каналов, индивидуальный stop на воркер, tasksWG/workersWG,
-worker сначала читает high non-blocking, потом select(high/normal/stop).
+DDD-версия задачи 2.
+Константы/ошибки живут в domain, application слой реализует orchestration воркеров и очередей.
 */
-
-const QueueCap = 256
-
-var ErrClosed = errors.New("pool closed")
 
 type taskItem struct {
 	ctx context.Context
@@ -40,7 +31,7 @@ func New(n int) *Service {
 	if n <= 0 {
 		n = 1
 	}
-	s := &Service{highQ: make(chan taskItem, QueueCap), normQ: make(chan taskItem, QueueCap), closeCh: make(chan struct{})}
+	s := &Service{highQ: make(chan taskItem, domain.DefaultQueueCapacity), normQ: make(chan taskItem, domain.DefaultQueueCapacity), closeCh: make(chan struct{})}
 	s.Resize(n)
 	return s
 }
@@ -58,7 +49,7 @@ func (s *Service) Submit(ctx context.Context, p domain.Priority, task domain.Tas
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return ErrClosed
+		return domain.ErrPoolClosed
 	}
 	s.tasksWG.Add(1)
 	s.mu.Unlock()
@@ -72,11 +63,12 @@ func (s *Service) Submit(ctx context.Context, p domain.Priority, task domain.Tas
 		return ctx.Err()
 	case <-s.closeCh:
 		s.tasksWG.Done()
-		return ErrClosed
+		return domain.ErrPoolClosed
 	case q <- taskItem{ctx: ctx, t: task}:
 		return nil
 	}
 }
+
 func (s *Service) Resize(n int) {
 	if n <= 0 {
 		n = 1
@@ -101,6 +93,7 @@ func (s *Service) Resize(n int) {
 	}
 	s.workers = s.workers[:n]
 }
+
 func (s *Service) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -135,6 +128,7 @@ func (s *Service) Close(ctx context.Context) error {
 		return nil
 	}
 }
+
 func (s *Service) run(w *worker) {
 	defer s.workersWG.Done()
 	for {
@@ -159,6 +153,7 @@ func (s *Service) run(w *worker) {
 		}
 	}
 }
+
 func (s *Service) exec(it taskItem) {
 	defer s.tasksWG.Done()
 	if it.ctx.Err() != nil {

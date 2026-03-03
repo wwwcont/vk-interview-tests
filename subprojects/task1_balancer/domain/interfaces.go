@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -22,3 +23,11 @@ type Balancer interface {
 	Pick() (Backend, Picked, error)
 	Update(backends []Backend)
 }
+
+var ErrNoHealthyBackend = errors.New("no healthy backend")
+
+const (
+	DefaultLatencyAlpha    = 0.2
+	DefaultPenaltyOnError  = 1.0
+	DefaultPenaltyRecovery = 0.15
+)

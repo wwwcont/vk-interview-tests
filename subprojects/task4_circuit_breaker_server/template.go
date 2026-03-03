@@ -21,3 +21,5 @@ func NewMux(b domain.Breaker) *http.ServeMux {
 	})
 	return mux
 }
+
+func Run(addr string, b domain.Breaker) error { return http.ListenAndServe(addr, NewMux(b)) }
