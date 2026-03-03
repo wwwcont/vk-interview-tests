@@ -8,18 +8,18 @@ import (
 	"time"
 )
 
-func TestWorkerPoolParallelismLimit(t *testing.T) {
-	const workers = 3
-	pool := NewWorkerPool(workers)
+func TestPoolParallelismLimit(t *testing.T) {
+	p := NewWorkerPool(3)
+	defer func() { _ = p.Close(context.Background()) }()
 
 	var running int32
 	var maxRunning int32
-	for i := 0; i < 20; i++ {
-		err := pool.Submit(func(context.Context) error {
+	for i := 0; i < 30; i++ {
+		err := p.Submit(context.Background(), Normal, func(context.Context) error {
 			cur := atomic.AddInt32(&running, 1)
 			for {
-				max := atomic.LoadInt32(&maxRunning)
-				if cur <= max || atomic.CompareAndSwapInt32(&maxRunning, max, cur) {
+				m := atomic.LoadInt32(&maxRunning)
+				if cur <= m || atomic.CompareAndSwapInt32(&maxRunning, m, cur) {
 					break
 				}
 			}
@@ -31,89 +31,132 @@ func TestWorkerPoolParallelismLimit(t *testing.T) {
 			t.Fatalf("Submit() error = %v", err)
 		}
 	}
-	if err := pool.Close(); err != nil {
+
+	if err := p.Close(context.Background()); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-
-	if got := atomic.LoadInt32(&maxRunning); got > workers {
-		t.Fatalf("max parallelism = %d, want <= %d", got, workers)
+	if got := atomic.LoadInt32(&maxRunning); got > 3 {
+		t.Fatalf("max running = %d, want <= 3", got)
 	}
 }
 
-func TestWorkerPoolAllTasksExecuted(t *testing.T) {
-	pool := NewWorkerPool(4)
-	var count int32
-	const total = 100
+func TestPoolResizeWorks(t *testing.T) {
+	p := NewWorkerPool(1)
+	defer func() { _ = p.Close(context.Background()) }()
 
-	for i := 0; i < total; i++ {
-		if err := pool.Submit(func(context.Context) error {
-			atomic.AddInt32(&count, 1)
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		if err := p.Submit(context.Background(), Normal, func(context.Context) error {
+			started <- struct{}{}
+			<-release
 			return nil
 		}); err != nil {
 			t.Fatalf("Submit() error = %v", err)
 		}
 	}
 
-	if err := pool.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("task did not start")
 	}
-	if atomic.LoadInt32(&count) != total {
-		t.Fatalf("executed = %d, want %d", count, total)
+
+	p.Resize(2)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("second task did not start after resize")
+	}
+
+	close(release)
+	if err := p.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
 }
 
-func TestWorkerPoolCloseWaitsForTasks(t *testing.T) {
-	pool := NewWorkerPool(1)
-	block := make(chan struct{})
-	if err := pool.Submit(func(context.Context) error {
-		<-block
+func TestPoolPriority(t *testing.T) {
+	p := NewWorkerPool(1)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	start := make(chan struct{})
+	if err := p.Submit(context.Background(), Normal, func(context.Context) error {
+		<-start
 		return nil
 	}); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
-	done := make(chan struct{})
-	go func() {
-		_ = pool.Close()
-		close(done)
-	}()
+	order := make(chan string, 2)
+	_ = p.Submit(context.Background(), Normal, func(context.Context) error { order <- "normal"; return nil })
+	_ = p.Submit(context.Background(), High, func(context.Context) error { order <- "high"; return nil })
 
-	select {
-	case <-done:
-		t.Fatal("Close() returned before task completed")
-	case <-time.After(30 * time.Millisecond):
+	close(start)
+	first := <-order
+	if first != "high" {
+		t.Fatalf("first executed = %s, want high", first)
+	}
+}
+
+func TestPoolCancelledContextTaskNotExecuted(t *testing.T) {
+	p := NewWorkerPool(1)
+	defer func() { _ = p.Close(context.Background()) }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var ran int32
+	err := p.Submit(ctx, Normal, func(context.Context) error {
+		atomic.StoreInt32(&ran, 1)
+		return nil
+	})
+	if err == nil {
+		t.Fatal("Submit() error = nil, want context canceled")
+	}
+
+	_ = p.Close(context.Background())
+	if atomic.LoadInt32(&ran) != 0 {
+		t.Fatal("task should not execute for canceled context")
+	}
+}
+
+func TestPoolCloseGracefulAndSubmitAfterClose(t *testing.T) {
+	p := NewWorkerPool(2)
+
+	block := make(chan struct{})
+	if err := p.Submit(context.Background(), Normal, func(context.Context) error { <-block; return nil }); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	closeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err := p.Close(closeCtx)
+	if err == nil {
+		t.Fatal("Close() should return timeout while task is blocked")
 	}
 
 	close(block)
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Close() did not return after task completion")
-	}
-}
-
-func TestWorkerPoolSubmitAfterClose(t *testing.T) {
-	pool := NewWorkerPool(1)
-	if err := pool.Close(); err != nil {
+	if err := p.Close(context.Background()); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	if err := pool.Submit(func(context.Context) error { return nil }); err == nil {
-		t.Fatal("Submit() error = nil, want non-nil")
+
+	if err := p.Submit(context.Background(), Normal, func(context.Context) error { return nil }); err == nil {
+		t.Fatal("Submit() after close should fail")
 	}
 }
 
-func TestWorkerPoolConcurrentSubmit(t *testing.T) {
-	pool := NewWorkerPool(8)
-	var wg sync.WaitGroup
-	var count int32
+func TestPoolConcurrentSubmit(t *testing.T) {
+	p := NewWorkerPool(8)
+	defer func() { _ = p.Close(context.Background()) }()
 
+	var wg sync.WaitGroup
+	var done int32
 	for i := 0; i < 200; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := pool.Submit(func(context.Context) error {
-				atomic.AddInt32(&count, 1)
+			if err := p.Submit(context.Background(), Normal, func(context.Context) error {
+				atomic.AddInt32(&done, 1)
 				return nil
 			}); err != nil {
 				t.Errorf("Submit() error = %v", err)
@@ -121,8 +164,10 @@ func TestWorkerPoolConcurrentSubmit(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	_ = pool.Close()
-	if atomic.LoadInt32(&count) != 200 {
-		t.Fatalf("executed = %d, want 200", count)
+	if err := p.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if atomic.LoadInt32(&done) != 200 {
+		t.Fatalf("done = %d, want 200", done)
 	}
 }

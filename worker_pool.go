@@ -6,84 +6,211 @@ import (
 	"sync"
 )
 
+type Priority int
+
+const (
+	High Priority = iota
+	Normal
+)
+
 type Task func(ctx context.Context) error
 
 type Pool interface {
-	Submit(task Task) error
-	Close() error
+	Submit(ctx context.Context, p Priority, task Task) error
+	Resize(n int)
+	Close(ctx context.Context) error
 }
 
-var errPoolClosed = errors.New("pool is closed")
+var errPoolClosed = errors.New("pool closed")
 
-type workerPool struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+type taskItem struct {
+	ctx  context.Context
+	task Task
+}
 
-	mu     sync.Mutex
+type workerHandle struct {
+	stop chan struct{}
+}
+
+type priorityPool struct {
+	mu sync.Mutex
+
 	closed bool
-	tasks  chan Task
+
+	highQ chan taskItem
+	normQ chan taskItem
+
+	closeCh chan struct{}
+
+	workers []*workerHandle
 
 	tasksWG   sync.WaitGroup
 	workersWG sync.WaitGroup
 }
 
-func NewWorkerPool(workers int) Pool {
-	if workers <= 0 {
-		workers = 1
+func NewWorkerPool(n int) Pool {
+	if n <= 0 {
+		n = 1
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	p := &workerPool{
-		ctx:    ctx,
-		cancel: cancel,
-		tasks:  make(chan Task, workers*2),
+	p := &priorityPool{
+		highQ:   make(chan taskItem, 1024),
+		normQ:   make(chan taskItem, 1024),
+		closeCh: make(chan struct{}),
 	}
-
-	for i := 0; i < workers; i++ {
-		p.workersWG.Add(1)
-		go p.worker()
-	}
-
+	p.Resize(n)
 	return p
 }
 
-func (p *workerPool) Submit(task Task) error {
+func (p *priorityPool) Submit(ctx context.Context, pr Priority, task Task) error {
 	if task == nil {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errPoolClosed
+	}
+	p.tasksWG.Add(1)
+	p.mu.Unlock()
+
+	item := taskItem{ctx: ctx, task: task}
+	queue := p.normQ
+	if pr == High {
+		queue = p.highQ
+	}
+
+	select {
+	case <-ctx.Done():
+		p.tasksWG.Done()
+		return ctx.Err()
+	case <-p.closeCh:
+		p.tasksWG.Done()
+		return errPoolClosed
+	case queue <- item:
+		return nil
+	}
+}
+
+func (p *priorityPool) Resize(n int) {
+	if n <= 0 {
+		n = 1
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	if p.closed {
-		return errPoolClosed
+		return
 	}
 
-	p.tasksWG.Add(1)
-	p.tasks <- task
-	return nil
+	current := len(p.workers)
+	if n > current {
+		for i := current; i < n; i++ {
+			h := &workerHandle{stop: make(chan struct{})}
+			p.workers = append(p.workers, h)
+			p.workersWG.Add(1)
+			go p.worker(h)
+		}
+		return
+	}
+
+	if n < current {
+		for i := current - 1; i >= n; i-- {
+			close(p.workers[i].stop)
+		}
+		p.workers = p.workers[:n]
+	}
 }
 
-func (p *workerPool) Close() error {
+func (p *priorityPool) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
 		return nil
 	}
 	p.closed = true
-	close(p.tasks)
+	close(p.closeCh)
 	p.mu.Unlock()
 
-	p.tasksWG.Wait()
-	p.cancel()
-	p.workersWG.Wait()
-	return nil
+	tasksDone := make(chan struct{})
+	go func() {
+		p.tasksWG.Wait()
+		close(tasksDone)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-tasksDone:
+	}
+
+	p.mu.Lock()
+	for _, h := range p.workers {
+		close(h.stop)
+	}
+	p.workers = nil
+	p.mu.Unlock()
+
+	workersDone := make(chan struct{})
+	go func() {
+		p.workersWG.Wait()
+		close(workersDone)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-workersDone:
+		return nil
+	}
 }
 
-func (p *workerPool) worker() {
+func (p *priorityPool) worker(h *workerHandle) {
 	defer p.workersWG.Done()
-	for task := range p.tasks {
-		_ = task(p.ctx)
-		p.tasksWG.Done()
+
+	for {
+		select {
+		case <-h.stop:
+			return
+		default:
+		}
+
+		select {
+		case item := <-p.highQ:
+			p.run(item)
+			continue
+		default:
+		}
+
+		select {
+		case <-h.stop:
+			return
+		case item := <-p.highQ:
+			p.run(item)
+		case item := <-p.normQ:
+			p.run(item)
+		}
 	}
+}
+
+func (p *priorityPool) run(item taskItem) {
+	defer p.tasksWG.Done()
+	if item.ctx.Err() != nil {
+		return
+	}
+	_ = item.task(item.ctx)
 }

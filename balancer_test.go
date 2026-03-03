@@ -3,108 +3,108 @@ package interview
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type backendMock struct {
 	id      string
 	healthy bool
+	calls   int32
 }
 
-func (b *backendMock) ID() string                                    { return b.id }
-func (b *backendMock) Healthy() bool                                 { return b.healthy }
-func (b *backendMock) Do(context.Context, Request) (Response, error) { return Response{}, nil }
+func (b *backendMock) ID() string    { return b.id }
+func (b *backendMock) Healthy() bool { return b.healthy }
+func (b *backendMock) Do(context.Context, Request) (Response, error) {
+	atomic.AddInt32(&b.calls, 1)
+	return Response{}, nil
+}
 
-func TestBalancerRoundRobinOrder(t *testing.T) {
+func TestLeastLoadDistribution(t *testing.T) {
 	b1 := &backendMock{id: "b1", healthy: true}
 	b2 := &backendMock{id: "b2", healthy: true}
-	b3 := &backendMock{id: "b3", healthy: true}
+	bal := NewLeastLoadBalancer([]Backend{b1, b2})
 
-	bal := NewRoundRobinBalancer([]Backend{b1, b2, b3})
-
-	got := make([]string, 0, 6)
-	for i := 0; i < 6; i++ {
-		be, err := bal.Next()
-		if err != nil {
-			t.Fatalf("Next() error = %v", err)
-		}
-		got = append(got, be.ID())
+	beA, doneA, err := bal.Pick()
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	beB, doneB, err := bal.Pick()
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if beA.ID() == beB.ID() {
+		t.Fatalf("expected different backends for first two picks, got same %s", beA.ID())
 	}
 
-	want := []string{"b1", "b2", "b3", "b1", "b2", "b3"}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("order[%d] = %s, want %s", i, got[i], want[i])
+	doneA.Done(nil, 10*time.Millisecond)
+	doneB.Done(nil, 10*time.Millisecond)
+}
+
+func TestLeastLoadSkipsUnhealthy(t *testing.T) {
+	b1 := &backendMock{id: "bad", healthy: false}
+	b2 := &backendMock{id: "good", healthy: true}
+	bal := NewLeastLoadBalancer([]Backend{b1, b2})
+
+	for i := 0; i < 5; i++ {
+		be, done, err := bal.Pick()
+		if err != nil {
+			t.Fatalf("Pick() error = %v", err)
 		}
+		if be.ID() != "good" {
+			t.Fatalf("Pick() = %s, want good", be.ID())
+		}
+		done.Done(nil, 2*time.Millisecond)
 	}
 }
 
-func TestBalancerSkipsUnhealthy(t *testing.T) {
-	b1 := &backendMock{id: "b1", healthy: false}
-	b2 := &backendMock{id: "b2", healthy: true}
-	bal := NewRoundRobinBalancer([]Backend{b1, b2})
-
-	for i := 0; i < 4; i++ {
-		be, err := bal.Next()
-		if err != nil {
-			t.Fatalf("Next() error = %v", err)
-		}
-		if be.ID() != "b2" {
-			t.Fatalf("got backend %s, want b2", be.ID())
-		}
+func TestLeastLoadConcurrentPick(t *testing.T) {
+	backends := []Backend{
+		&backendMock{id: "a", healthy: true},
+		&backendMock{id: "b", healthy: true},
+		&backendMock{id: "c", healthy: true},
 	}
-}
+	bal := NewLeastLoadBalancer(backends)
 
-func TestBalancerConcurrentNext(t *testing.T) {
-	b1 := &backendMock{id: "b1", healthy: true}
-	b2 := &backendMock{id: "b2", healthy: true}
-	bal := NewRoundRobinBalancer([]Backend{b1, b2})
-
-	const calls = 1000
+	const n = 500
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	counts := map[string]int{}
-
-	for i := 0; i < calls; i++ {
+	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			be, err := bal.Next()
+			_, done, err := bal.Pick()
 			if err != nil {
-				t.Errorf("Next() error = %v", err)
+				t.Errorf("Pick() error = %v", err)
 				return
 			}
-			mu.Lock()
-			counts[be.ID()]++
-			mu.Unlock()
+			time.Sleep(time.Millisecond)
+			done.Done(nil, time.Millisecond)
 		}()
 	}
 	wg.Wait()
-
-	if counts["b1"]+counts["b2"] != calls {
-		t.Fatalf("total calls = %d, want %d", counts["b1"]+counts["b2"], calls)
-	}
 }
 
-func TestBalancerUpdateReplacesBackends(t *testing.T) {
-	b1 := &backendMock{id: "b1", healthy: true}
-	bal := NewRoundRobinBalancer([]Backend{b1})
+func TestLeastLoadLatencyPenaltyAffectsChoice(t *testing.T) {
+	fast := &backendMock{id: "fast", healthy: true}
+	slow := &backendMock{id: "slow", healthy: true}
+	bal := NewLeastLoadBalancer([]Backend{slow, fast})
 
-	be, err := bal.Next()
-	if err != nil || be.ID() != "b1" {
-		t.Fatalf("initial Next() = (%v, %v), want b1,nil", be, err)
+	be, done, err := bal.Pick()
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
 	}
-
-	b2 := &backendMock{id: "b2", healthy: true}
-	bal.Update([]Backend{b2})
-
-	for i := 0; i < 3; i++ {
-		be, err = bal.Next()
-		if err != nil {
-			t.Fatalf("Next() error = %v", err)
-		}
-		if be.ID() != "b2" {
-			t.Fatalf("got backend %s, want b2", be.ID())
-		}
+	if be.ID() != "slow" {
+		t.Fatalf("first Pick() = %s, want slow", be.ID())
 	}
+	done.Done(nil, 500*time.Millisecond)
+
+	be, done, err = bal.Pick()
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if be.ID() != "fast" {
+		t.Fatalf("second Pick() = %s, want fast due to penalty", be.ID())
+	}
+	done.Done(nil, 5*time.Millisecond)
 }

@@ -1,55 +1,75 @@
 package interview
 
 import (
-	"sync"
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
 
-func TestTokenBucketBurst(t *testing.T) {
-	l := NewTokenBucketLimiter(1, 3)
-	if !l.Allow() || !l.Allow() || !l.Allow() {
-		t.Fatal("expected first 3 Allow() calls to pass")
+func TestPerKeyIndependent(t *testing.T) {
+	l := NewPerKeyLimiter(0, 1, time.Second)
+	if !l.Allow("a") {
+		t.Fatal("a first allow should pass")
 	}
-	if l.Allow() {
-		t.Fatal("expected 4th Allow() to fail")
+	if l.Allow("a") {
+		t.Fatal("a second allow should fail")
 	}
-}
-
-func TestTokenBucketRPSLimit(t *testing.T) {
-	l := NewTokenBucketLimiter(5, 1)
-	if !l.Allow() {
-		t.Fatal("first Allow() should pass")
-	}
-	if l.Allow() {
-		t.Fatal("immediate second Allow() should fail")
-	}
-	time.Sleep(230 * time.Millisecond)
-	if !l.Allow() {
-		t.Fatal("Allow() should pass after refill time")
+	if !l.Allow("b") {
+		t.Fatal("b should be independent from a")
 	}
 }
 
-func TestTokenBucketConcurrentAllow(t *testing.T) {
-	l := NewTokenBucketLimiter(0, 50)
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	allowed := 0
-	for i := 0; i < 200; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if l.Allow() {
-				mu.Lock()
-				allowed++
-				mu.Unlock()
-			}
-		}()
+func TestPerKeyBurst(t *testing.T) {
+	l := NewPerKeyLimiter(0, 3, time.Second)
+	if !l.Allow("k") || !l.Allow("k") || !l.Allow("k") {
+		t.Fatal("first three allows should pass")
 	}
-	wg.Wait()
+	if l.Allow("k") {
+		t.Fatal("fourth allow should fail")
+	}
+}
 
-	if allowed != 50 {
-		t.Fatalf("allowed = %d, want 50", allowed)
+func TestAcquireBlocksAndThenPasses(t *testing.T) {
+	l := NewPerKeyLimiter(5, 1, time.Second)
+	if !l.Allow("k") {
+		t.Fatal("initial allow should pass")
+	}
+
+	start := time.Now()
+	if err := l.Acquire(context.Background(), "k"); err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	if time.Since(start) < 150*time.Millisecond {
+		t.Fatal("Acquire() did not block long enough")
+	}
+}
+
+func TestAcquireCancelled(t *testing.T) {
+	l := NewPerKeyLimiter(0, 1, time.Second)
+	if !l.Allow("k") {
+		t.Fatal("initial allow should pass")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err := l.Acquire(ctx, "k")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Acquire() err = %v, want deadline exceeded", err)
+	}
+}
+
+func TestKeyTTLRemovesIdleKey(t *testing.T) {
+	l := NewPerKeyLimiter(0, 1, 40*time.Millisecond)
+	if !l.Allow("k") {
+		t.Fatal("first allow should pass")
+	}
+	if l.Allow("k") {
+		t.Fatal("second allow should fail with zero rate")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	if !l.Allow("k") {
+		t.Fatal("allow should pass after key ttl cleanup")
 	}
 }

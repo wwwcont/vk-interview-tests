@@ -9,86 +9,126 @@ import (
 	"time"
 )
 
-func TestCircuitBreakerClosedToOpen(t *testing.T) {
-	cb := NewCircuitBreaker(2, 50*time.Millisecond)
+func newTestBreaker() Breaker {
+	return NewRollingCircuitBreaker(breakerConfig{
+		WindowSize:       4,
+		ErrorThreshold:   0.5,
+		ResetTimeout:     40 * time.Millisecond,
+		MaxProbeRequests: 2,
+		IsFailure: func(err error) bool {
+			return err != nil
+		},
+	})
+}
+
+func TestBreakerClosedToOpen(t *testing.T) {
+	b := newTestBreaker()
 	fail := errors.New("fail")
 
-	if err := cb.Execute(context.Background(), func(context.Context) error { return fail }); !errors.Is(err, fail) {
-		t.Fatalf("first Execute err = %v, want fail", err)
-	}
-	if err := cb.Execute(context.Background(), func(context.Context) error { return fail }); !errors.Is(err, fail) {
-		t.Fatalf("second Execute err = %v, want fail", err)
-	}
-	if err := cb.Execute(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, errCircuitOpen) {
-		t.Fatalf("third Execute err = %v, want errCircuitOpen", err)
+	_ = b.Execute(context.Background(), func(context.Context) error { return fail })
+	_ = b.Execute(context.Background(), func(context.Context) error { return fail })
+	_ = b.Execute(context.Background(), func(context.Context) error { return nil })
+	_ = b.Execute(context.Background(), func(context.Context) error { return nil })
+
+	if b.State() != Open {
+		t.Fatalf("State() = %v, want Open", b.State())
 	}
 }
 
-func TestCircuitBreakerOpenToHalfOpenAndRecover(t *testing.T) {
-	cb := NewCircuitBreaker(1, 40*time.Millisecond)
-	_ = cb.Execute(context.Background(), func(context.Context) error { return errors.New("fail") })
-
-	if err := cb.Execute(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, errCircuitOpen) {
-		t.Fatalf("Execute in OPEN err = %v, want errCircuitOpen", err)
+func TestBreakerOpenToHalfOpen(t *testing.T) {
+	b := newTestBreaker()
+	fail := errors.New("fail")
+	for i := 0; i < 4; i++ {
+		_ = b.Execute(context.Background(), func(context.Context) error { return fail })
 	}
-
+	if b.State() != Open {
+		t.Fatalf("State() = %v, want Open", b.State())
+	}
 	time.Sleep(50 * time.Millisecond)
-	if err := cb.Execute(context.Background(), func(context.Context) error { return nil }); err != nil {
-		t.Fatalf("half-open probe err = %v, want nil", err)
-	}
-	if err := cb.Execute(context.Background(), func(context.Context) error { return nil }); err != nil {
-		t.Fatalf("after recovery Execute err = %v, want nil", err)
+	if b.State() != HalfOpen {
+		t.Fatalf("State() = %v, want HalfOpen", b.State())
 	}
 }
 
-func TestCircuitBreakerHalfOpenFailureBackToOpen(t *testing.T) {
-	cb := NewCircuitBreaker(1, 20*time.Millisecond)
-	_ = cb.Execute(context.Background(), func(context.Context) error { return errors.New("fail") })
-	time.Sleep(25 * time.Millisecond)
-
-	probeErr := errors.New("probe-fail")
-	if err := cb.Execute(context.Background(), func(context.Context) error { return probeErr }); !errors.Is(err, probeErr) {
-		t.Fatalf("half-open err = %v, want probeErr", err)
+func TestBreakerHalfOpenRecovery(t *testing.T) {
+	b := newTestBreaker()
+	for i := 0; i < 4; i++ {
+		_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("f") })
 	}
-	if err := cb.Execute(context.Background(), func(context.Context) error { return nil }); !errors.Is(err, errCircuitOpen) {
-		t.Fatalf("should be open again, err = %v", err)
+	time.Sleep(50 * time.Millisecond)
+
+	if err := b.Execute(context.Background(), func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("probe 1 err = %v", err)
+	}
+	if err := b.Execute(context.Background(), func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("probe 2 err = %v", err)
+	}
+	if b.State() != Closed {
+		t.Fatalf("State() = %v, want Closed", b.State())
 	}
 }
 
-func TestCircuitBreakerConcurrentExecute(t *testing.T) {
-	cb := NewCircuitBreaker(1, time.Second)
-	var called int32
-	start := make(chan struct{})
+func TestBreakerHalfOpenFailureBackToOpen(t *testing.T) {
+	b := newTestBreaker()
+	for i := 0; i < 4; i++ {
+		_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("f") })
+	}
+	time.Sleep(50 * time.Millisecond)
 
+	err := b.Execute(context.Background(), func(context.Context) error { return errors.New("probe") })
+	if err == nil {
+		t.Fatal("probe err = nil, want error")
+	}
+	if b.State() != Open {
+		t.Fatalf("State() = %v, want Open", b.State())
+	}
+}
+
+func TestBreakerPredicate(t *testing.T) {
+	b := NewRollingCircuitBreaker(breakerConfig{
+		WindowSize:       2,
+		ErrorThreshold:   0.5,
+		ResetTimeout:     10 * time.Millisecond,
+		MaxProbeRequests: 1,
+		IsFailure: func(err error) bool {
+			return err != nil && err.Error() == "fatal"
+		},
+	})
+
+	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("non-fatal") })
+	_ = b.Execute(context.Background(), func(context.Context) error { return nil })
+
+	if b.State() != Closed {
+		t.Fatalf("State() = %v, want Closed", b.State())
+	}
+}
+
+func TestBreakerConcurrentExecute(t *testing.T) {
+	b := NewRollingCircuitBreaker(breakerConfig{
+		WindowSize:       4,
+		ErrorThreshold:   0.5,
+		ResetTimeout:     time.Second,
+		MaxProbeRequests: 1,
+	})
+
+	var calls int32
 	var wg sync.WaitGroup
-	errs := make(chan error, 100)
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			err := cb.Execute(context.Background(), func(context.Context) error {
-				atomic.AddInt32(&called, 1)
-				<-start
+			_ = b.Execute(context.Background(), func(context.Context) error {
+				atomic.AddInt32(&calls, 1)
 				return errors.New("x")
 			})
-			errs <- err
 		}()
 	}
-	close(start)
 	wg.Wait()
-	close(errs)
 
-	openErrors := 0
-	for err := range errs {
-		if errors.Is(err, errCircuitOpen) {
-			openErrors++
-		}
+	if atomic.LoadInt32(&calls) == 0 {
+		t.Fatal("expected at least one call")
 	}
-
-	if atomic.LoadInt32(&called) == 0 {
-		t.Fatal("expected at least one function call")
-	}
-	if openErrors == 0 {
-		t.Fatal("expected some errCircuitOpen in concurrent scenario")
+	if b.State() != Open {
+		t.Fatalf("State() = %v, want Open", b.State())
 	}
 }
