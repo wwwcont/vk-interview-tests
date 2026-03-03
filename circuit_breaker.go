@@ -7,6 +7,41 @@ import (
 	"time"
 )
 
+/*
+ЗАДАЧА 4 — Circuit Breaker (Rolling Window + Half-Open Probes)
+
+Постановка:
+- Нужно реализовать breaker со состояниями Closed/Open/HalfOpen.
+- В Closed копим rolling-статистику ошибок.
+- Если доля ошибок в окне >= errorThreshold, переходим в Open.
+- В Open запросы отклоняются с ошибкой "breaker open".
+- Через resetTimeout из Open допускаем переход в HalfOpen.
+- В HalfOpen разрешено не более maxProbeRequests параллельных проб:
+  - если проба фейлится (по predicate IsFailure) -> сразу Open,
+  - если нужное число проб успешно -> Closed (восстановление).
+- Потокобезопасность обязательна.
+- Lock нельзя держать во время выполнения fn().
+
+Алгоритм решения:
+1) Храним конфиг + состояние:
+   - rolling окно bool-значений (failure/success),
+   - текущую позицию, число записей и число ошибок,
+   - openedAt,
+   - счётчики probeInFlight/probeSuccess.
+2) beforeExecute под mutex:
+   - если Open и resetTimeout прошёл -> HalfOpen,
+   - Open -> ошибка "breaker open",
+   - HalfOpen -> пускаем не более MaxProbeRequests.
+3) Выполняем fn(ctx) без mutex.
+4) afterExecute под mutex:
+   - Closed: кладём результат в окно, считаем errorRate и при превышении порога -> Open.
+   - HalfOpen: обновляем probe-счётчики,
+     при failure -> Open,
+     при достаточном числе успешных probe и отсутствии inflight -> Closed.
+5) State(): возвращает текущее состояние; для Open учитывает, что логически
+   после resetTimeout состояние готово к HalfOpen.
+*/
+
 type State int
 
 const (

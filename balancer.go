@@ -8,6 +8,45 @@ import (
 	"time"
 )
 
+/*
+ЗАДАЧА 1 — Load Balancer (Least-Load + Latency-aware)
+
+Постановка:
+- Есть набор backend-ов (ID, Do, Healthy).
+- Нужен балансировщик, который на каждом Pick выбирает лучший backend.
+- Лучший определяется минимальным score = inflight + latencyPenalty,
+  где inflight — число незавершённых запросов, latencyPenalty — EMA задержки.
+- Unhealthy backend должен игнорироваться.
+- Если healthy backend нет — вернуть ошибку.
+- После обработки запроса вызывается Done(err, latency):
+  - уменьшает inflight,
+  - обновляет latency EMA.
+- Update(backends) должен атомарно заменить актуальный список backend-ов.
+- Потокобезопасность обязательна.
+- Lock нельзя держать во время внешнего I/O (Do выполняется вне балансировщика,
+  а балансировщик отдаёт только выбранный backend и callback Done).
+
+Алгоритм решения:
+1) Храним:
+   - срез backend-ов,
+   - map stats[id] -> {inflight, latencyEMA}.
+2) Pick под mutex:
+   - линейно просматривает backend-ы,
+   - фильтрует Healthy()==false,
+   - считает score = inflight + latencyEMA,
+   - выбирает backend с минимальным score,
+   - инкрементирует inflight выбранного,
+   - возвращает backend + объект Picked.
+3) Done вызывается через once (защита от двойного Done):
+   - декремент inflight (не ниже нуля),
+   - обновление EMA: ema = alpha*latency + (1-alpha)*ema.
+4) Update под mutex:
+   - копирует входной срез,
+   - создаёт новый stats map только для актуальных backend ID,
+   - переносит существующую статистику для совпавших ID,
+   - заменяет backends+stats одним критическим участком.
+*/
+
 type Backend interface {
 	ID() string
 	Do(ctx context.Context, req Request) (Response, error)

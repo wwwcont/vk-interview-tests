@@ -7,6 +7,40 @@ import (
 	"time"
 )
 
+/*
+ЗАДАЧА 5 — TTL Cache (Singleflight + Size Limit + Stale-While-Revalidate)
+
+Постановка:
+- Нужен потокобезопасный in-memory cache.
+- У каждого значения свой TTL.
+- При превышении maxEntries должны удаляться старые элементы (LRU допустим).
+- Метод GetOrLoad должен поддерживать singleflight:
+  для одного key параллельные запросы должны делить один loader-вызов.
+- Запрещено использовать x/sync/singleflight.
+- (Опционально) stale-while-revalidate — в этом решении не включён,
+  используется строгая проверка TTL.
+
+Алгоритм решения:
+1) Храним:
+   - map key -> entry(value, expiresAt, elem),
+   - двусвязный список LRU,
+   - map inflight key -> loadCall(done,val,err) для singleflight.
+2) Get:
+   - под mutex проверяем наличие и TTL,
+   - истёкшие записи удаляем лениво,
+   - живые поднимаем в голову LRU.
+3) Set:
+   - upsert записи,
+   - обновляем LRU,
+   - если размер > maxEntries, выталкиваем с хвоста LRU.
+4) GetOrLoad:
+   - сначала fast-path через Get,
+   - затем через inflight map определяем leader/follower:
+     - leader запускает loader,
+     - followers ждут completion того же loadCall,
+   - leader публикует результат всем waiters и сохраняет в cache при успехе.
+*/
+
 type Cache interface {
 	Get(key string) (any, bool)
 	Set(key string, value any, ttl time.Duration)

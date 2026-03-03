@@ -6,6 +6,38 @@ import (
 	"time"
 )
 
+/*
+ЗАДАЧА 3 — Rate Limiter (Per-Key Token Bucket + Blocking Acquire)
+
+Постановка:
+- Нужно ограничивать частоту отдельно для каждого key.
+- Интерфейс:
+  - Allow(key) bool: неблокирующая попытка взять токен.
+  - Acquire(ctx, key) error: блокируется, пока не появится токен или ctx не отменён.
+- Конфигурация: rate (tokens/sec), burst, keyTTL.
+- Неактивные ключи должны удаляться (lazy cleanup), чтобы карта бакетов не росла бесконечно.
+- Потокобезопасность обязательна.
+- Нельзя использовать time.Ticker; расчёт пополнения делается через time.Now().
+
+Алгоритм решения:
+1) Для каждого key храним bucket:
+   - tokens,
+   - lastFill (последний момент пополнения),
+   - lastSeen (последняя активность по ключу).
+2) Под одним mutex:
+   - cleanup просроченных ключей по keyTTL,
+   - get/create bucket,
+   - refill: tokens += elapsed*rate, clamp до burst.
+3) Allow:
+   - после refill, если tokens >= 1 — уменьшаем и возвращаем true,
+     иначе false.
+4) Acquire:
+   - циклически проверяем наличие токена,
+   - если токена нет, вычисляем сколько ждать до 1 токена,
+   - ждём через time.NewTimer(wait),
+   - выходим по ctx.Done().
+*/
+
 type Limiter interface {
 	Allow(key string) bool
 	Acquire(ctx context.Context, key string) error
