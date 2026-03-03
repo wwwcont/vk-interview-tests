@@ -2,9 +2,13 @@ package interview
 
 import (
 	"context"
+	"sort"
 	"sync"
 )
 
+// Задача 1: реализовать CounterService c буферизацией инкрементов в памяти,
+// потокобезопасным доступом и батчевым Flush без удержания lock во время I/O.
+// Get должен возвращать сумму значения из репозитория и ещё не сброшенного pending delta.
 type CounterRepo interface {
 	Add(ctx context.Context, id string, delta int64) error
 	Get(ctx context.Context, id string) (int64, error)
@@ -50,28 +54,54 @@ func (s *counterService) Get(ctx context.Context, id string) (int64, error) {
 }
 
 func (s *counterService) Flush(ctx context.Context) error {
-	s.mu.Lock()
-	batch := s.pending
-	s.pending = make(map[string]int64)
-	s.mu.Unlock()
+	batch := s.takeSnapshot()
+	if len(batch) == 0 {
+		return nil
+	}
 
-	for id, delta := range batch {
+	keys := sortedKeys(batch)
+	for i, id := range keys {
+		delta := batch[id]
 		if delta == 0 {
 			continue
 		}
+
 		if err := s.repo.Add(ctx, id, delta); err != nil {
-			s.mu.Lock()
-			s.pending[id] += delta
-			for k, v := range batch {
-				if k == id {
-					continue
-				}
-				s.pending[k] += v
-			}
-			s.mu.Unlock()
+			s.restoreNotFlushed(keys[i:], batch)
 			return err
 		}
 	}
 
 	return nil
+}
+
+func (s *counterService) takeSnapshot() map[string]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.pending) == 0 {
+		return nil
+	}
+
+	batch := s.pending
+	s.pending = make(map[string]int64)
+	return batch
+}
+
+func (s *counterService) restoreNotFlushed(ids []string, batch map[string]int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, id := range ids {
+		s.pending[id] += batch[id]
+	}
+}
+
+func sortedKeys(m map[string]int64) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

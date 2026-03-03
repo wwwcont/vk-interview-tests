@@ -1,7 +1,13 @@
 package interview
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
+// Задача 3: реализовать сервис создания заказа с транзакцией и внешним сервисом.
+// Последовательность: BeginTx -> Create -> Reserve -> Commit.
+// При любой ошибке нужен rollback, а commit вызывается только при полном успехе.
 type Tx interface {
 	Commit() error
 	Rollback() error
@@ -29,6 +35,8 @@ type orderService struct {
 	client ExternalClient
 }
 
+var errNilTx = errors.New("repo returned nil tx")
+
 func NewOrderService(repo Repo, client ExternalClient) Service {
 	return &orderService{repo: repo, client: client}
 }
@@ -38,13 +46,20 @@ func (s *orderService) CreateOrder(ctx context.Context, order Order) (err error)
 	if err != nil {
 		return err
 	}
+	if tx == nil {
+		return errNilTx
+	}
 
 	committed := false
 	defer func() {
 		if committed {
 			return
 		}
-		if rbErr := tx.Rollback(); rbErr != nil && err == nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			if err != nil {
+				err = errors.Join(err, rbErr)
+				return
+			}
 			err = rbErr
 		}
 	}()

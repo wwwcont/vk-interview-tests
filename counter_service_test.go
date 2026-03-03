@@ -2,14 +2,16 @@ package interview
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 )
 
 type counterRepoMock struct {
-	mu     sync.Mutex
-	values map[string]int64
-	adds   map[string]int64
+	mu       sync.Mutex
+	values   map[string]int64
+	adds     map[string]int64
+	failOnID string
 }
 
 func newCounterRepoMock() *counterRepoMock {
@@ -19,6 +21,9 @@ func newCounterRepoMock() *counterRepoMock {
 func (m *counterRepoMock) Add(_ context.Context, id string, delta int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failOnID == id {
+		return errors.New("add failed")
+	}
 	m.values[id] += delta
 	m.adds[id] += delta
 	return nil
@@ -92,5 +97,41 @@ func TestCounterServiceGetIncludesPending(t *testing.T) {
 	}
 	if got != 14 {
 		t.Fatalf("Get() = %d, want 14", got)
+	}
+}
+
+func TestCounterServiceFlushPartialFailureRestoresOnlyNotFlushed(t *testing.T) {
+	repo := newCounterRepoMock()
+	repo.failOnID = "b"
+	svc := NewCounterService(repo)
+
+	svc.Incr("a", 2)
+	svc.Incr("b", 3)
+
+	err := svc.Flush(context.Background())
+	if err == nil {
+		t.Fatal("Flush() error = nil, want non-nil")
+	}
+
+	repo.mu.Lock()
+	if repo.values["a"] != 2 {
+		t.Fatalf("values[a] = %d, want 2", repo.values["a"])
+	}
+	repo.mu.Unlock()
+
+	got, err := svc.Get(context.Background(), "a")
+	if err != nil {
+		t.Fatalf("Get(a) error = %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("Get(a) = %d, want 2 (без повторной постановки уже flush-нутого значения)", got)
+	}
+
+	got, err = svc.Get(context.Background(), "b")
+	if err != nil {
+		t.Fatalf("Get(b) error = %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("Get(b) = %d, want 3", got)
 	}
 }

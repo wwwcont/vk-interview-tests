@@ -37,6 +37,9 @@ func (m *repoMock) BeginTx(context.Context) (Tx, error) {
 	if m.beginErr != nil {
 		return nil, m.beginErr
 	}
+	if m.tx == nil {
+		return nil, nil
+	}
 	return m.tx, nil
 }
 
@@ -62,6 +65,16 @@ func TestOrderServiceCreateOrderBeginTxError(t *testing.T) {
 	err := svc.CreateOrder(context.Background(), Order{ID: "1"})
 	if err == nil || err.Error() != "begin" {
 		t.Fatalf("CreateOrder() err = %v, want begin", err)
+	}
+}
+
+func TestOrderServiceCreateOrderNilTx(t *testing.T) {
+	repo := &repoMock{}
+	svc := NewOrderService(repo, &externalMock{})
+
+	err := svc.CreateOrder(context.Background(), Order{ID: "1"})
+	if !errors.Is(err, errNilTx) {
+		t.Fatalf("CreateOrder() err = %v, want errNilTx", err)
 	}
 }
 
@@ -118,6 +131,19 @@ func TestOrderServiceCreateOrderCommitError(t *testing.T) {
 	}
 	if tx.rollbackCalled != 1 {
 		t.Fatalf("rollbackCalled = %d, want 1", tx.rollbackCalled)
+	}
+}
+
+func TestOrderServiceCreateOrderRollbackJoinError(t *testing.T) {
+	createErr := errors.New("create")
+	rollbackErr := errors.New("rollback")
+	tx := &txMock{rollbackErr: rollbackErr}
+	repo := &repoMock{tx: tx, createErr: createErr}
+	svc := NewOrderService(repo, &externalMock{})
+
+	err := svc.CreateOrder(context.Background(), Order{ID: "1"})
+	if !errors.Is(err, createErr) || !errors.Is(err, rollbackErr) {
+		t.Fatalf("CreateOrder() err = %v, want join(create, rollback)", err)
 	}
 }
 
