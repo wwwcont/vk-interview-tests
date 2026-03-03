@@ -1,0 +1,173 @@
+package counter
+
+import (
+	"context"
+	"errors"
+	"hash/fnv"
+	"sync"
+	"time"
+)
+
+type Repo interface {
+	AddBatch(ctx context.Context, deltas map[string]int64) error
+	Get(ctx context.Context, id string) (int64, error)
+}
+
+type Config struct {
+	Shards        int
+	FlushInterval time.Duration
+	FlushTimeout  time.Duration
+}
+
+type Service struct {
+	repo Repo
+	cfg  Config
+
+	shards []counterShard
+
+	flushMu sync.Mutex
+
+	stopCh chan struct{}
+	doneCh chan struct{}
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+type counterShard struct {
+	mu     sync.Mutex
+	deltas map[string]int64
+}
+
+func New(repo Repo, cfg Config) (*Service, error) {
+	if repo == nil {
+		return nil, errors.New("repo is nil")
+	}
+	if cfg.Shards <= 0 {
+		return nil, errors.New("shards must be > 0")
+	}
+	if cfg.FlushInterval <= 0 {
+		return nil, errors.New("flush interval must be > 0")
+	}
+	if cfg.FlushTimeout < 0 {
+		return nil, errors.New("flush timeout must be >= 0")
+	}
+
+	s := &Service{
+		repo:   repo,
+		cfg:    cfg,
+		shards: make([]counterShard, cfg.Shards),
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+
+	for i := range s.shards {
+		s.shards[i].deltas = make(map[string]int64)
+	}
+
+	go s.flushLoop()
+
+	return s, nil
+}
+
+func (s *Service) Incr(id string, delta int64) {
+	if delta == 0 {
+		return
+	}
+	shard := &s.shards[s.shardIndex(id)]
+	shard.mu.Lock()
+	shard.deltas[id] += delta
+	shard.mu.Unlock()
+}
+
+func (s *Service) Get(ctx context.Context, id string) (int64, error) {
+	stored, err := s.repo.Get(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+
+	shard := &s.shards[s.shardIndex(id)]
+	shard.mu.Lock()
+	pending := shard.deltas[id]
+	shard.mu.Unlock()
+
+	return stored + pending, nil
+}
+
+func (s *Service) Flush(ctx context.Context) error {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	deltas := s.snapshotAndReset()
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	flushCtx := ctx
+	cancel := func() {}
+	if s.cfg.FlushTimeout > 0 {
+		flushCtx, cancel = context.WithTimeout(ctx, s.cfg.FlushTimeout)
+	}
+	defer cancel()
+
+	if err := s.repo.AddBatch(flushCtx, deltas); err != nil {
+		s.restore(deltas)
+		return err
+	}
+
+	return nil
+}
+
+func (s *Service) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.stopCh)
+		<-s.doneCh
+		s.closeErr = s.Flush(context.Background())
+	})
+	return s.closeErr
+}
+
+func (s *Service) flushLoop() {
+	defer close(s.doneCh)
+
+	ticker := time.NewTicker(s.cfg.FlushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			_ = s.Flush(context.Background())
+		case <-s.stopCh:
+			return
+		}
+	}
+}
+
+func (s *Service) snapshotAndReset() map[string]int64 {
+	merged := make(map[string]int64)
+	for i := range s.shards {
+		shard := &s.shards[i]
+		shard.mu.Lock()
+		for id, delta := range shard.deltas {
+			merged[id] += delta
+		}
+		shard.deltas = make(map[string]int64)
+		shard.mu.Unlock()
+	}
+	return merged
+}
+
+func (s *Service) restore(deltas map[string]int64) {
+	for id, delta := range deltas {
+		shard := &s.shards[s.shardIndex(id)]
+		shard.mu.Lock()
+		shard.deltas[id] += delta
+		shard.mu.Unlock()
+	}
+}
+
+func (s *Service) shardIndex(id string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	return int(h.Sum32() % uint32(len(s.shards)))
+}

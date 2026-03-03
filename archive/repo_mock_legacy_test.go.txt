@@ -1,0 +1,32 @@
+package counter
+
+import (
+	"context"
+	"sync"
+)
+
+type mockRepo struct {
+	mu      sync.Mutex
+	store   map[string]int64
+	batches int
+}
+
+func newMockRepo() *mockRepo {
+	return &mockRepo{store: make(map[string]int64)}
+}
+
+func (m *mockRepo) AddBatch(_ context.Context, deltas map[string]int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, delta := range deltas {
+		m.store[id] += delta
+	}
+	m.batches++
+	return nil
+}
+
+func (m *mockRepo) Get(_ context.Context, id string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store[id], nil
+}

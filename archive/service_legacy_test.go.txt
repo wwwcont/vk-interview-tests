@@ -1,0 +1,98 @@
+package counter
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestIncrConcurrent(t *testing.T) {
+	repo := newMockRepo()
+	svc, err := New(repo, Config{
+		Shards:        32,
+		FlushInterval: time.Hour,
+		FlushTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+
+	const (
+		goroutines = 50
+		perWorker  = 2000
+	)
+
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				svc.Incr("video-1", 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := svc.Get(context.Background(), "video-1")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+
+	want := int64(goroutines * perWorker)
+	if got != want {
+		t.Fatalf("Get() = %d, want %d", got, want)
+	}
+}
+
+func TestFlushWritesToRepo(t *testing.T) {
+	repo := newMockRepo()
+	svc, err := New(repo, Config{
+		Shards:        8,
+		FlushInterval: time.Hour,
+		FlushTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Close() })
+
+	svc.Incr("a", 3)
+	svc.Incr("a", 2)
+	svc.Incr("b", 7)
+
+	if err := svc.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+
+	a, _ := repo.Get(context.Background(), "a")
+	b, _ := repo.Get(context.Background(), "b")
+	if a != 5 || b != 7 {
+		t.Fatalf("repo values: a=%d b=%d, want a=5 b=7", a, b)
+	}
+}
+
+func TestCloseDoesFinalFlush(t *testing.T) {
+	repo := newMockRepo()
+	svc, err := New(repo, Config{
+		Shards:        4,
+		FlushInterval: time.Hour,
+		FlushTimeout:  time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	svc.Incr("final", 11)
+
+	if err := svc.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	got, _ := repo.Get(context.Background(), "final")
+	if got != 11 {
+		t.Fatalf("repo value after Close() = %d, want 11", got)
+	}
+}
