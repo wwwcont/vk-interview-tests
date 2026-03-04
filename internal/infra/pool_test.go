@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"vk-interview-tests/internal/app"
@@ -30,18 +31,33 @@ func TestCreateJob_Idempotency(t *testing.T) {
 	}
 }
 
-func TestWorkerPool_Priority(t *testing.T) {
-	s, p := fixture(1)
+func TestCreateJob_SameKeyConcurrentSingleExecution(t *testing.T) {
+	s, p := fixture(2)
 	defer p.Shutdown(context.Background())
-	_, _ = s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 120}})
-	n2, _ := s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 5}})
-	h, _ := s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "high", Payload: domain.SleepPayload{MS: 5}})
-	wait(t, s, h.ID, domain.Succeeded)
-	wait(t, s, n2.ID, domain.Succeeded)
-	hj, _ := s.GetJob(context.Background(), h.ID)
-	nj, _ := s.GetJob(context.Background(), n2.ID)
-	if hj.StartedAt.After(*nj.StartedAt) {
-		t.Fatal("high started late")
+	c := app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 20}, IdempotencyKey: "same-key"}
+	ids := make([]string, 10)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			j, e := s.CreateJob(context.Background(), c)
+			if e == nil {
+				ids[i] = j.ID
+			}
+		}(i)
+	}
+	wg.Wait()
+	first := ids[0]
+	for _, id := range ids {
+		if id != first {
+			t.Fatalf("different ids: %v", ids)
+		}
+	}
+	wait(t, s, first, domain.Succeeded)
+	j, _ := s.GetJob(context.Background(), first)
+	if j.Attempts != 1 {
+		t.Fatalf("expected one execution, attempts=%d", j.Attempts)
 	}
 }
 

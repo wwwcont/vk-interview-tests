@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"sync"
 	"time"
 	"vk-interview-tests/internal/domain"
 )
@@ -20,22 +21,51 @@ type Pool interface {
 	IsDown() bool
 }
 
+type call struct {
+	done chan struct{}
+	job  *domain.Job
+	err  error
+}
 type Service struct {
-	repo domain.Repo
-	pool Pool
+	repo     domain.Repo
+	pool     Pool
+	mu       sync.Mutex
+	inflight map[string]*call
 }
 
-func New(repo domain.Repo, pool Pool) *Service { return &Service{repo: repo, pool: pool} }
+func New(repo domain.Repo, pool Pool) *Service {
+	return &Service{repo: repo, pool: pool, inflight: map[string]*call{}}
+}
 
 func (s *Service) CreateJob(ctx context.Context, c CreateCmd) (*domain.Job, error) {
 	if s.pool.IsDown() {
 		return nil, domain.ErrShuttingDown
 	}
-	if c.IdempotencyKey != "" {
-		if j, e := s.repo.ByKey(c.IdempotencyKey); e == nil {
-			return j, nil
-		}
+	if c.IdempotencyKey == "" {
+		return s.create(ctx, c)
 	}
+	if j, e := s.repo.ByKey(c.IdempotencyKey); e == nil {
+		return j, nil
+	}
+
+	s.mu.Lock()
+	if in := s.inflight[c.IdempotencyKey]; in != nil {
+		s.mu.Unlock()
+		<-in.done
+		return in.job, in.err
+	}
+	in := &call{done: make(chan struct{})}
+	s.inflight[c.IdempotencyKey] = in
+	s.mu.Unlock()
+	in.job, in.err = s.create(ctx, c)
+	close(in.done)
+	s.mu.Lock()
+	delete(s.inflight, c.IdempotencyKey)
+	s.mu.Unlock()
+	return in.job, in.err
+}
+
+func (s *Service) create(ctx context.Context, c CreateCmd) (*domain.Job, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}

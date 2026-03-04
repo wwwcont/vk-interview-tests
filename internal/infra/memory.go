@@ -1,18 +1,12 @@
 package infra
 
 /*
-Задача: простой Job Runner для часового интервью.
-Выполнено:
-- in-memory репозиторий + idempotency index;
-- worker pool c high/normal очередью и bounded capacity;
-- динамический resize числа воркеров;
-- retries (max 3) с backoff 50/100/200ms;
-- graceful shutdown: новые задачи отклоняются, queued -> canceled, running ждём до timeout.
-Логика:
-- репозиторий хранит копии Job под mutex;
-- pool хранит две очереди под cond+mutex;
-- worker берёт high, иначе normal; выполняет job без удержания mutex;
-- shutdown переводит pool в down, чистит очереди и ждёт завершения воркеров.
+Упрощённый Job Runner для интервью:
+- in-memory repo + idempotency index;
+- одна bounded очередь (без разделения high/normal);
+- resize воркеров на лету;
+- retry (max 3) с backoff 50/100/200ms;
+- graceful shutdown: reject новых, queued -> canceled, running ждём до timeout.
 */
 
 import (
@@ -62,16 +56,16 @@ func (r *Repo) Bind(k, id string) {
 
 type worker struct{ stop chan struct{} }
 type Pool struct {
-	repo         *Repo
-	mu           sync.Mutex
-	cond         *sync.Cond
-	cap          int
-	down         bool
-	high, normal []*domain.Job
-	workers      map[int]worker
-	nextID       int
-	wg           sync.WaitGroup
-	running      int
+	repo    *Repo
+	mu      sync.Mutex
+	cond    *sync.Cond
+	cap     int
+	down    bool
+	q       []*domain.Job
+	workers map[int]worker
+	nextID  int
+	wg      sync.WaitGroup
+	running int
 }
 
 func NewPool(repo *Repo, n, cap int) *Pool {
@@ -90,14 +84,10 @@ func (p *Pool) Enqueue(ctx context.Context, j *domain.Job) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if len(p.high)+len(p.normal) >= p.cap {
+	if len(p.q) >= p.cap {
 		return domain.ErrQueueFull
 	}
-	if j.Priority == domain.High {
-		p.high = append(p.high, j)
-	} else {
-		p.normal = append(p.normal, j)
-	}
+	p.q = append(p.q, j)
 	p.cond.Signal()
 	log.Printf("job created id=%s", j.ID)
 	return nil
@@ -131,10 +121,10 @@ func (p *Pool) loop(stop <-chan struct{}) {
 	defer p.wg.Done()
 	for {
 		p.mu.Lock()
-		for len(p.high) == 0 && len(p.normal) == 0 && !p.down {
+		for len(p.q) == 0 && !p.down {
 			p.cond.Wait()
 		}
-		if p.down && len(p.high) == 0 && len(p.normal) == 0 {
+		if p.down && len(p.q) == 0 {
 			p.mu.Unlock()
 			return
 		}
@@ -144,7 +134,8 @@ func (p *Pool) loop(stop <-chan struct{}) {
 			return
 		default:
 		}
-		j := p.pop()
+		j := p.q[0]
+		p.q = p.q[1:]
 		p.running++
 		p.mu.Unlock()
 		exec(j)
@@ -153,16 +144,6 @@ func (p *Pool) loop(stop <-chan struct{}) {
 		p.running--
 		p.mu.Unlock()
 	}
-}
-func (p *Pool) pop() *domain.Job {
-	if len(p.high) > 0 {
-		j := p.high[0]
-		p.high = p.high[1:]
-		return j
-	}
-	j := p.normal[0]
-	p.normal = p.normal[1:]
-	return j
 }
 func exec(j *domain.Job) {
 	n := time.Now().UTC()
@@ -206,14 +187,14 @@ func (p *Pool) Shutdown(ctx context.Context) ([]string, error) {
 		return nil, ctx.Err()
 	}
 	p.down = true
-	for _, j := range append(p.high, p.normal...) {
+	for _, j := range p.q {
 		j.Status = domain.Canceled
 		f := time.Now().UTC()
 		j.FinishedAt = &f
 		j.LastError = "canceled on shutdown"
 		p.repo.Save(j)
 	}
-	p.high, p.normal = nil, nil
+	p.q = nil
 	p.cond.Broadcast()
 	p.mu.Unlock()
 	done := make(chan struct{})
