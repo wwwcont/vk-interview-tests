@@ -1,3 +1,5 @@
-# Job Runner
+# Job Runner (interview-friendly)
 
-Shutdown behavior: when graceful shutdown starts, new jobs are rejected and all queued (not yet running) jobs are marked as `canceled`. Running jobs are allowed to finish until timeout.
+Упрощённый вариант для live-coding: in-memory repo + worker pool с high/normal приоритетом, resize, retry (до 3), idempotency и graceful shutdown.
+
+Политика shutdown: новые jobs отклоняются, queued jobs помечаются `canceled`, running jobs дожидаются до таймаута.

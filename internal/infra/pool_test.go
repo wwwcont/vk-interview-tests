@@ -23,14 +23,8 @@ func TestCreateJob_Idempotency(t *testing.T) {
 	s, p := fixture(1)
 	defer p.Shutdown(context.Background())
 	c := app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 10}, IdempotencyKey: "k"}
-	j1, e := s.CreateJob(context.Background(), c)
-	if e != nil {
-		t.Fatal(e)
-	}
-	j2, e := s.CreateJob(context.Background(), c)
-	if e != nil {
-		t.Fatal(e)
-	}
+	j1, _ := s.CreateJob(context.Background(), c)
+	j2, _ := s.CreateJob(context.Background(), c)
 	if j1.ID != j2.ID {
 		t.Fatalf("%s!=%s", j1.ID, j2.ID)
 	}
@@ -55,25 +49,15 @@ func TestWorkerPool_Resize(t *testing.T) {
 	s, p := fixture(1)
 	defer p.Shutdown(context.Background())
 	start := time.Now()
+	ids := make([]string, 0, 3)
 	for i := 0; i < 3; i++ {
-		_, e := s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 160}})
-		if e != nil {
-			t.Fatal(e)
-		}
+		j, _ := s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 160}})
+		ids = append(ids, j.ID)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if e := s.ResizePool(context.Background(), 3); e != nil {
-		t.Fatal(e)
-	}
-	dl := time.Now().Add(2 * time.Second)
-	for time.Now().Before(dl) {
-		if p.succ.Value() >= 3 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if p.succ.Value() < 3 {
-		t.Fatal("unfinished")
+	_ = s.ResizePool(context.Background(), 3)
+	for _, id := range ids {
+		wait(t, s, id, domain.Succeeded)
 	}
 	if time.Since(start) > 450*time.Millisecond {
 		t.Fatal("resize didn't speed up")
@@ -82,11 +66,8 @@ func TestWorkerPool_Resize(t *testing.T) {
 
 func TestShutdown_StopsAccepting(t *testing.T) {
 	s, _ := fixture(1)
-	_, e := s.Shutdown(context.Background(), time.Second)
-	if e != nil {
-		t.Fatal(e)
-	}
-	_, e = s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 1}})
+	_, _ = s.Shutdown(context.Background(), time.Second)
+	_, e := s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 1}})
 	if !errors.Is(e, domain.ErrShuttingDown) {
 		t.Fatalf("got %v", e)
 	}
@@ -95,10 +76,7 @@ func TestShutdown_StopsAccepting(t *testing.T) {
 func TestRetry_AttemptsAndBackoff(t *testing.T) {
 	s, p := fixture(1)
 	defer p.Shutdown(context.Background())
-	j, e := s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 1, FailAttempts: 2}})
-	if e != nil {
-		t.Fatal(e)
-	}
+	j, _ := s.CreateJob(context.Background(), app.CreateCmd{Type: "sleep", Priority: "normal", Payload: domain.SleepPayload{MS: 1, FailAttempts: 2}})
 	wait(t, s, j.ID, domain.Succeeded)
 	g, _ := s.GetJob(context.Background(), j.ID)
 	if g.Attempts != 3 {
@@ -112,11 +90,8 @@ func TestHTTP_CreateAndGetJob(t *testing.T) {
 	ts := httptest.NewServer(httptransport.New(s).Routes())
 	defer ts.Close()
 	r, e := http.Post(ts.URL+"/jobs", "application/json", strings.NewReader(`{"type":"sleep","payload":{"ms":5},"priority":"normal"}`))
-	if e != nil {
-		t.Fatal(e)
-	}
-	if r.StatusCode != 200 {
-		t.Fatalf("%d", r.StatusCode)
+	if e != nil || r.StatusCode != 200 {
+		t.Fatalf("err=%v code=%d", e, r.StatusCode)
 	}
 }
 

@@ -3,8 +3,8 @@ package infra
 import (
 	"context"
 	"errors"
-	"expvar"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 	"vk-interview-tests/internal/domain"
@@ -45,56 +45,45 @@ func (r *Repo) Bind(k, id string) {
 	r.mu.Unlock()
 }
 
+type worker struct{ stop chan struct{} }
 type Pool struct {
-	repo                             *Repo
-	mu                               sync.Mutex
-	down                             bool
-	cap                              int
-	hq, nq                           chan *domain.Job
-	ctx                              context.Context
-	cancel                           context.CancelFunc
-	wg                               sync.WaitGroup
-	workers                          map[int]chan struct{}
-	wid                              int
-	active                           map[string]struct{}
-	created, succ, fail, run, qh, qn *expvar.Int
+	repo         *Repo
+	mu           sync.Mutex
+	cond         *sync.Cond
+	cap          int
+	down         bool
+	high, normal []*domain.Job
+	workers      map[int]worker
+	nextID       int
+	wg           sync.WaitGroup
+	running      int
 }
 
-func NewPool(r *Repo, n, cap int) *Pool {
-	c, x := context.WithCancel(context.Background())
-	p := &Pool{repo: r, cap: cap, hq: make(chan *domain.Job, cap), nq: make(chan *domain.Job, cap), ctx: c, cancel: x, workers: map[int]chan struct{}{}, active: map[string]struct{}{}, created: m("jobs_created_total"), succ: m("jobs_succeeded_total"), fail: m("jobs_failed_total"), run: m("jobs_running"), qh: m("queue_high_len"), qn: m("queue_normal_len")}
+func NewPool(repo *Repo, n, cap int) *Pool {
+	p := &Pool{repo: repo, cap: cap, workers: map[int]worker{}}
+	p.cond = sync.NewCond(&p.mu)
 	_ = p.Resize(n)
 	return p
-}
-func m(n string) *expvar.Int {
-	if v := expvar.Get(n); v != nil {
-		return v.(*expvar.Int)
-	}
-	return expvar.NewInt(n)
 }
 func (p *Pool) IsDown() bool { p.mu.Lock(); d := p.down; p.mu.Unlock(); return d }
 func (p *Pool) Enqueue(ctx context.Context, j *domain.Job) error {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.down {
-		p.mu.Unlock()
 		return domain.ErrShuttingDown
 	}
-	if len(p.hq)+len(p.nq) >= p.cap {
-		p.mu.Unlock()
-		return domain.ErrQueueFull
-	}
-	p.mu.Unlock()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if j.Priority == domain.High {
-		p.hq <- j
-	} else {
-		p.nq <- j
+	if len(p.high)+len(p.normal) >= p.cap {
+		return domain.ErrQueueFull
 	}
-	p.qh.Set(int64(len(p.hq)))
-	p.qn.Set(int64(len(p.nq)))
-	p.created.Add(1)
+	if j.Priority == domain.High {
+		p.high = append(p.high, j)
+	} else {
+		p.normal = append(p.normal, j)
+	}
+	p.cond.Signal()
 	log.Printf("job created id=%s", j.ID)
 	return nil
 }
@@ -104,67 +93,68 @@ func (p *Pool) Resize(n int) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	c := len(p.workers)
-	for ; c < n; c++ {
-		ch := make(chan struct{})
-		p.workers[p.wid] = ch
-		p.wid++
+	cur := len(p.workers)
+	for ; cur < n; cur++ {
+		id := p.nextID
+		p.nextID++
+		w := worker{stop: make(chan struct{})}
+		p.workers[id] = w
 		p.wg.Add(1)
-		go p.worker(ch)
+		go p.loop(w.stop)
 	}
-	for ; c > n; c-- {
-		for id, ch := range p.workers {
-			close(ch)
+	for ; cur > n; cur-- {
+		for id, w := range p.workers {
+			close(w.stop)
 			delete(p.workers, id)
 			break
 		}
 	}
+	p.cond.Broadcast()
 	return nil
 }
-func (p *Pool) next(stop <-chan struct{}) (*domain.Job, bool) {
-	for {
-		select {
-		case <-p.ctx.Done():
-			return nil, false
-		case <-stop:
-			return nil, false
-		case j := <-p.hq:
-			return j, true
-		default:
-		}
-		select {
-		case <-p.ctx.Done():
-			return nil, false
-		case <-stop:
-			return nil, false
-		case j := <-p.hq:
-			return j, true
-		case j := <-p.nq:
-			return j, true
-		}
+func (p *Pool) pop() *domain.Job {
+	if len(p.high) > 0 {
+		j := p.high[0]
+		p.high = p.high[1:]
+		return j
 	}
+	j := p.normal[0]
+	p.normal = p.normal[1:]
+	return j
 }
-func (p *Pool) worker(stop <-chan struct{}) {
+func (p *Pool) loop(stop <-chan struct{}) {
 	defer p.wg.Done()
 	for {
-		j, ok := p.next(stop)
-		if !ok {
+		p.mu.Lock()
+		for len(p.high) == 0 && len(p.normal) == 0 && !p.down {
+			p.cond.Wait()
+		}
+		if p.down && len(p.high) == 0 && len(p.normal) == 0 {
+			p.mu.Unlock()
 			return
 		}
-		p.exec(j)
+		select {
+		case <-stop:
+			p.mu.Unlock()
+			return
+		default:
+		}
+		j := p.pop()
+		p.running++
+		p.mu.Unlock()
+		exec(j)
+		p.mu.Lock()
+		p.running--
+		p.mu.Unlock()
+		p.repo.Save(j)
 	}
 }
-func (p *Pool) exec(j *domain.Job) {
+func exec(j *domain.Job) {
 	n := time.Now().UTC()
 	j.Status = domain.Running
 	if j.StartedAt == nil {
 		j.StartedAt = &n
 	}
-	p.repo.Save(j)
-	p.run.Add(1)
-	p.mu.Lock()
-	p.active[j.ID] = struct{}{}
-	p.mu.Unlock()
 	log.Printf("job start id=%s", j.ID)
 	var e error
 	for a := 1; a <= 3; a++ {
@@ -181,17 +171,9 @@ func (p *Pool) exec(j *domain.Job) {
 	}
 	if e != nil {
 		j.Status = domain.Failed
-		p.fail.Add(1)
-	} else {
-		p.succ.Add(1)
 	}
 	f := time.Now().UTC()
 	j.FinishedAt = &f
-	p.repo.Save(j)
-	p.run.Add(-1)
-	p.mu.Lock()
-	delete(p.active, j.ID)
-	p.mu.Unlock()
 	log.Printf("job done id=%s status=%s", j.ID, j.Status)
 }
 func run(j *domain.Job) error {
@@ -209,37 +191,25 @@ func (p *Pool) Shutdown(ctx context.Context) ([]string, error) {
 		return nil, ctx.Err()
 	}
 	p.down = true
-	p.mu.Unlock()
-	cancel := func(ch chan *domain.Job) {
-		for {
-			select {
-			case j := <-ch:
-				j.Status = domain.Canceled
-				f := time.Now().UTC()
-				j.FinishedAt = &f
-				j.LastError = "canceled on shutdown"
-				p.repo.Save(j)
-			default:
-				return
-			}
-		}
+	for _, j := range append(p.high, p.normal...) {
+		j.Status = domain.Canceled
+		f := time.Now().UTC()
+		j.FinishedAt = &f
+		j.LastError = "canceled on shutdown"
+		p.repo.Save(j)
 	}
-	cancel(p.hq)
-	cancel(p.nq)
-	p.qh.Set(0)
-	p.qn.Set(0)
+	p.high, p.normal = nil, nil
+	p.cond.Broadcast()
+	p.mu.Unlock()
 	d := make(chan struct{})
-	go func() { p.cancel(); p.wg.Wait(); close(d) }()
+	go func() { p.wg.Wait(); close(d) }()
 	select {
 	case <-d:
 		return nil, nil
 	case <-ctx.Done():
 		p.mu.Lock()
-		ids := make([]string, 0, len(p.active))
-		for id := range p.active {
-			ids = append(ids, id)
-		}
+		r := p.running
 		p.mu.Unlock()
-		return ids, ctx.Err()
+		return []string{"running:" + strconv.Itoa(r)}, ctx.Err()
 	}
 }
