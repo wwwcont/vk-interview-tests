@@ -1,5 +1,20 @@
 package infra
 
+/*
+Задача: простой Job Runner для часового интервью.
+Выполнено:
+- in-memory репозиторий + idempotency index;
+- worker pool c high/normal очередью и bounded capacity;
+- динамический resize числа воркеров;
+- retries (max 3) с backoff 50/100/200ms;
+- graceful shutdown: новые задачи отклоняются, queued -> canceled, running ждём до timeout.
+Логика:
+- репозиторий хранит копии Job под mutex;
+- pool хранит две очереди под cond+mutex;
+- worker берёт high, иначе normal; выполняет job без удержания mutex;
+- shutdown переводит pool в down, чистит очереди и ждёт завершения воркеров.
+*/
+
 import (
 	"context"
 	"errors"
@@ -16,9 +31,9 @@ type Repo struct {
 	key  map[string]string
 }
 
-func NewRepo() *Repo                  { return &Repo{jobs: map[string]*domain.Job{}, key: map[string]string{}} }
-func clone(j *domain.Job) *domain.Job { c := *j; return &c }
-func (r *Repo) Save(j *domain.Job)    { r.mu.Lock(); r.jobs[j.ID] = clone(j); r.mu.Unlock() }
+func NewRepo() *Repo               { return &Repo{jobs: map[string]*domain.Job{}, key: map[string]string{}} }
+func cp(j *domain.Job) *domain.Job { c := *j; return &c }
+func (r *Repo) Save(j *domain.Job) { r.mu.Lock(); r.jobs[j.ID] = cp(j); r.mu.Unlock() }
 func (r *Repo) ByID(id string) (*domain.Job, error) {
 	r.mu.RLock()
 	j := r.jobs[id]
@@ -26,7 +41,7 @@ func (r *Repo) ByID(id string) (*domain.Job, error) {
 	if j == nil {
 		return nil, domain.ErrNotFound
 	}
-	return clone(j), nil
+	return cp(j), nil
 }
 func (r *Repo) ByKey(k string) (*domain.Job, error) {
 	r.mu.RLock()
@@ -112,16 +127,6 @@ func (p *Pool) Resize(n int) error {
 	p.cond.Broadcast()
 	return nil
 }
-func (p *Pool) pop() *domain.Job {
-	if len(p.high) > 0 {
-		j := p.high[0]
-		p.high = p.high[1:]
-		return j
-	}
-	j := p.normal[0]
-	p.normal = p.normal[1:]
-	return j
-}
 func (p *Pool) loop(stop <-chan struct{}) {
 	defer p.wg.Done()
 	for {
@@ -143,11 +148,21 @@ func (p *Pool) loop(stop <-chan struct{}) {
 		p.running++
 		p.mu.Unlock()
 		exec(j)
+		p.repo.Save(j)
 		p.mu.Lock()
 		p.running--
 		p.mu.Unlock()
-		p.repo.Save(j)
 	}
+}
+func (p *Pool) pop() *domain.Job {
+	if len(p.high) > 0 {
+		j := p.high[0]
+		p.high = p.high[1:]
+		return j
+	}
+	j := p.normal[0]
+	p.normal = p.normal[1:]
+	return j
 }
 func exec(j *domain.Job) {
 	n := time.Now().UTC()
@@ -201,10 +216,10 @@ func (p *Pool) Shutdown(ctx context.Context) ([]string, error) {
 	p.high, p.normal = nil, nil
 	p.cond.Broadcast()
 	p.mu.Unlock()
-	d := make(chan struct{})
-	go func() { p.wg.Wait(); close(d) }()
+	done := make(chan struct{})
+	go func() { p.wg.Wait(); close(done) }()
 	select {
-	case <-d:
+	case <-done:
 		return nil, nil
 	case <-ctx.Done():
 		p.mu.Lock()

@@ -12,18 +12,21 @@ type CreateCmd struct {
 	Type, Priority, IdempotencyKey string
 	Payload                        domain.SleepPayload
 }
+
 type Pool interface {
 	Enqueue(context.Context, *domain.Job) error
 	Resize(int) error
 	Shutdown(context.Context) ([]string, error)
 	IsDown() bool
 }
+
 type Service struct {
 	repo domain.Repo
 	pool Pool
 }
 
 func New(repo domain.Repo, pool Pool) *Service { return &Service{repo: repo, pool: pool} }
+
 func (s *Service) CreateJob(ctx context.Context, c CreateCmd) (*domain.Job, error) {
 	if s.pool.IsDown() {
 		return nil, domain.ErrShuttingDown
@@ -49,6 +52,7 @@ func (s *Service) CreateJob(ctx context.Context, c CreateCmd) (*domain.Job, erro
 	}
 	return j, nil
 }
+
 func (s *Service) GetJob(_ context.Context, id string) (*domain.Job, error) { return s.repo.ByID(id) }
 func (s *Service) ResizePool(_ context.Context, n int) error                { return s.pool.Resize(n) }
 func (s *Service) Shutdown(ctx context.Context, t time.Duration) ([]string, error) {

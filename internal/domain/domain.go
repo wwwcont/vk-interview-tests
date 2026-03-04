@@ -6,7 +6,9 @@ import (
 )
 
 type JobType string
+
 type Priority string
+
 type Status string
 
 const (
@@ -34,6 +36,7 @@ type SleepPayload struct {
 	Fail         bool `json:"fail,omitempty"`
 	FailAttempts int  `json:"fail_attempts,omitempty"`
 }
+
 type Job struct {
 	ID, LastError, IdempotencyKey string
 	Type                          JobType

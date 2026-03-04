@@ -15,6 +15,7 @@ import (
 type Handler struct{ s *app.Service }
 
 func New(s *app.Service) *Handler { return &Handler{s: s} }
+
 func (h *Handler) Routes() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("POST /jobs", h.create)
@@ -74,6 +75,7 @@ func (h *Handler) shutdown(w http.ResponseWriter, r *http.Request) {
 	}
 	ok(w, map[string]string{"status": "ok"})
 }
+
 func (h *Handler) err(w http.ResponseWriter, e error) {
 	s, c := 500, "internal_error"
 	switch {
