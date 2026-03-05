@@ -1,4 +1,14 @@
-package main
+// Tests in this file focus only on the core breaker algorithm.
+//
+// Goal in simple words:
+// keep a very small set of tests that are easy to explain in live coding,
+// while still checking the most important behavior:
+// - opening after repeated failures,
+// - rejecting while open,
+// - half-open recovery path,
+// - failure classifier rules,
+// - half-open probe limit.
+package breaker
 
 import (
 	"context"
@@ -7,21 +17,24 @@ import (
 	"time"
 )
 
+// newBreaker creates breaker for test and fails test on config error.
 func newBreaker(t *testing.T, cfg Config) *CircuitBreaker {
 	t.Helper()
-	b, err := NewCircuitBreaker(cfg)
+	b, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
 }
 
+// fakeClock injects deterministic time source and returns step function.
 func fakeClock(b *CircuitBreaker, start time.Time) func(time.Duration) {
 	now := start
 	b.now = func() time.Time { return now }
 	return func(d time.Duration) { now = now.Add(d) }
 }
 
+// toHalfOpen opens breaker with one failure, then advances clock to timeout.
 func toHalfOpen(t *testing.T, b *CircuitBreaker, step func(time.Duration), timeout time.Duration) {
 	t.Helper()
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
@@ -31,6 +44,7 @@ func toHalfOpen(t *testing.T, b *CircuitBreaker, step func(time.Duration), timeo
 	}
 }
 
+// TestClosedToOpenAtThreshold verifies failure counter opens breaker at threshold.
 func TestClosedToOpenAtThreshold(t *testing.T) {
 	b := newBreaker(t, Config{MaxFailures: 2, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
@@ -43,6 +57,7 @@ func TestClosedToOpenAtThreshold(t *testing.T) {
 	}
 }
 
+// TestOpenRejectsAndSkipsFn verifies open breaker rejects and does not run fn.
 func TestOpenRejectsAndSkipsFn(t *testing.T) {
 	b := newBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
@@ -53,6 +68,7 @@ func TestOpenRejectsAndSkipsFn(t *testing.T) {
 	}
 }
 
+// TestLazyHalfOpenAndProbeSuccessCloses verifies lazy half-open and successful recovery.
 func TestLazyHalfOpenAndProbeSuccessCloses(t *testing.T) {
 	b := newBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 	step := fakeClock(b, time.Unix(10, 0))
@@ -65,6 +81,7 @@ func TestLazyHalfOpenAndProbeSuccessCloses(t *testing.T) {
 	}
 }
 
+// TestClassifierRules verifies default classifier: canceled is neutral, deadline is failure.
 func TestClassifierRules(t *testing.T) {
 	t.Run("context canceled is not failure", func(t *testing.T) {
 		b := newBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
@@ -73,6 +90,7 @@ func TestClassifierRules(t *testing.T) {
 			t.Fatalf("err=%v state=%s", err, b.State().State)
 		}
 	})
+
 	t.Run("deadline exceeded is failure", func(t *testing.T) {
 		b := newBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 		_ = b.Execute(context.Background(), func(context.Context) error { return context.DeadlineExceeded })
@@ -82,6 +100,7 @@ func TestClassifierRules(t *testing.T) {
 	})
 }
 
+// TestHalfOpenNonFailureAndProbeLimit verifies neutral error in half-open and probe limit behavior.
 func TestHalfOpenNonFailureAndProbeLimit(t *testing.T) {
 	b := newBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 	step := fakeClock(b, time.Unix(10, 0))
