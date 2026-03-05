@@ -18,6 +18,22 @@ func newTestBreaker(t *testing.T, cfg Config) *CircuitBreaker {
 	return b
 }
 
+func setFakeNow(b *CircuitBreaker, start time.Time) func(time.Duration) {
+	cur := start
+	b.now = func() time.Time { return cur }
+	return func(d time.Duration) { cur = cur.Add(d) }
+}
+
+func openAndMoveToHalfOpen(t *testing.T, b *CircuitBreaker, advance func(time.Duration), d time.Duration) {
+	t.Helper()
+	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
+	advance(d)
+	_ = b.State()
+	if s := b.State(); s.State != StateHalfOpen {
+		t.Fatalf("state=%s, want HALF_OPEN", s.State)
+	}
+}
+
 func TestClosedToOpenAfterMaxFailures(t *testing.T) {
 	b := newTestBreaker(t, Config{MaxFailures: 3, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 	for i := 0; i < 2; i++ {
@@ -26,140 +42,146 @@ func TestClosedToOpenAfterMaxFailures(t *testing.T) {
 			t.Fatalf("expected error")
 		}
 	}
-
-	s := b.State()
-	if s.State != StateClosed || s.Failures != 2 {
+	if s := b.State(); s.State != StateClosed || s.Failures != 2 {
 		t.Fatalf("unexpected state before threshold: %+v", s)
 	}
-
-	err := b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
-	if err == nil {
+	if err := b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") }); err == nil {
 		t.Fatalf("expected error")
 	}
-
-	s = b.State()
-	if s.State != StateOpen {
-		t.Fatalf("state = %s, want OPEN", s.State)
+	if s := b.State(); s.State != StateOpen {
+		t.Fatalf("state=%s, want OPEN", s.State)
 	}
 }
 
 func TestOpenRejectsAndDoesNotCallFn(t *testing.T) {
 	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
-
 	called := false
-	err := b.Execute(context.Background(), func(context.Context) error {
-		called = true
-		return nil
-	})
+	err := b.Execute(context.Background(), func(context.Context) error { called = true; return nil })
 	if !errors.Is(err, ErrBreakerOpen) {
-		t.Fatalf("error = %v, want ErrBreakerOpen", err)
+		t.Fatalf("error=%v, want ErrBreakerOpen", err)
 	}
 	if called {
-		t.Fatalf("function should not be called while open")
+		t.Fatalf("function should not be called while OPEN")
 	}
 }
 
 func TestExecuteAfterResetTimeoutEntersHalfOpen(t *testing.T) {
-	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: 30 * time.Millisecond, HalfOpenMaxProbes: 1})
+	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
+	advance := setFakeNow(b, time.Unix(100, 0))
 	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
-	time.Sleep(40 * time.Millisecond)
-
-	started := make(chan struct{})
-	finish := make(chan struct{})
-	result := make(chan error, 1)
-	go func() {
-		result <- b.Execute(context.Background(), func(context.Context) error {
-			close(started)
-			<-finish
-			return nil
-		})
-	}()
-
-	<-started
-	s := b.State()
-	if s.State != StateHalfOpen {
-		t.Fatalf("state = %s, want HALF_OPEN", s.State)
-	}
-	close(finish)
-	if err := <-result; err != nil {
-		t.Fatalf("unexpected execute error: %v", err)
+	advance(time.Second)
+	if s := b.State(); s.State != StateHalfOpen {
+		t.Fatalf("state=%s, want HALF_OPEN", s.State)
 	}
 }
 
 func TestHalfOpenSuccessClosesBreaker(t *testing.T) {
-	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: 20 * time.Millisecond, HalfOpenMaxProbes: 1})
-	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
-	time.Sleep(30 * time.Millisecond)
-
-	err := b.Execute(context.Background(), func(context.Context) error { return nil })
-	if err != nil {
-		t.Fatalf("execute error = %v", err)
+	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
+	advance := setFakeNow(b, time.Unix(100, 0))
+	openAndMoveToHalfOpen(t, b, advance, time.Second)
+	if err := b.Execute(context.Background(), func(context.Context) error { return nil }); err != nil {
+		t.Fatalf("execute error=%v", err)
 	}
-
-	s := b.State()
-	if s.State != StateClosed || s.Failures != 0 {
-		t.Fatalf("unexpected state after half-open success: %+v", s)
+	if s := b.State(); s.State != StateClosed || s.Failures != 0 {
+		t.Fatalf("unexpected state: %+v", s)
 	}
 }
 
 func TestHalfOpenFailureReopensBreaker(t *testing.T) {
-	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: 20 * time.Millisecond, HalfOpenMaxProbes: 1})
-	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
-	time.Sleep(30 * time.Millisecond)
-
-	err := b.Execute(context.Background(), func(context.Context) error { return errors.New("still bad") })
-	if err == nil {
+	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
+	advance := setFakeNow(b, time.Unix(100, 0))
+	openAndMoveToHalfOpen(t, b, advance, time.Second)
+	if err := b.Execute(context.Background(), func(context.Context) error { return errors.New("still bad") }); err == nil {
 		t.Fatalf("expected error")
 	}
+	if s := b.State(); s.State != StateOpen {
+		t.Fatalf("state=%s, want OPEN", s.State)
+	}
+}
 
-	s := b.State()
-	if s.State != StateOpen {
-		t.Fatalf("state = %s, want OPEN", s.State)
+func TestClassifier_ContextCanceledNotFailure(t *testing.T) {
+	b := newTestBreaker(t, Config{MaxFailures: 2, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
+	err := b.Execute(context.Background(), func(context.Context) error { return context.Canceled })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context.Canceled", err)
+	}
+	if s := b.State(); s.State != StateClosed || s.Failures != 0 {
+		t.Fatalf("unexpected state: %+v", s)
+	}
+}
+
+func TestClassifier_DeadlineExceededIsFailure(t *testing.T) {
+	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
+	err := b.Execute(context.Background(), func(context.Context) error { return context.DeadlineExceeded })
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v, want context.DeadlineExceeded", err)
+	}
+	if s := b.State(); s.State != StateOpen {
+		t.Fatalf("state=%s, want OPEN", s.State)
+	}
+}
+
+func TestHalfOpen_NonFailureDoesNotReopen(t *testing.T) {
+	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
+	advance := setFakeNow(b, time.Unix(100, 0))
+	openAndMoveToHalfOpen(t, b, advance, time.Second)
+	err := b.Execute(context.Background(), func(context.Context) error { return context.Canceled })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context.Canceled", err)
+	}
+	if s := b.State(); s.State != StateHalfOpen || s.Failures != 1 {
+		t.Fatalf("unexpected state after non-failure probe: %+v", s)
+	}
+}
+
+func TestHalfOpen_ProbeLimitErrTooManyProbes(t *testing.T) {
+	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
+	advance := setFakeNow(b, time.Unix(100, 0))
+	openAndMoveToHalfOpen(t, b, advance, time.Second)
+
+	block := make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		_ = b.Execute(context.Background(), func(context.Context) error { close(started); <-block; return nil })
+	}()
+	<-started
+	err := b.Execute(context.Background(), func(context.Context) error { return nil })
+	close(block)
+	if !errors.Is(err, ErrTooManyProbes) {
+		t.Fatalf("error=%v, want ErrTooManyProbes", err)
 	}
 }
 
 func TestHalfOpenProbeLimitParallel(t *testing.T) {
-	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: 20 * time.Millisecond, HalfOpenMaxProbes: 2})
-	_ = b.Execute(context.Background(), func(context.Context) error { return errors.New("boom") })
-	time.Sleep(30 * time.Millisecond)
+	b := newTestBreaker(t, Config{MaxFailures: 1, ResetTimeout: time.Second, HalfOpenMaxProbes: 2})
+	advance := setFakeNow(b, time.Unix(100, 0))
+	openAndMoveToHalfOpen(t, b, advance, time.Second)
 
 	block := make(chan struct{})
 	var started atomic.Int32
 	var wg sync.WaitGroup
 	errs := make([]error, 4)
-
 	for i := range 4 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = b.Execute(context.Background(), func(context.Context) error {
-				started.Add(1)
-				<-block
-				return nil
-			})
+			errs[i] = b.Execute(context.Background(), func(context.Context) error { started.Add(1); <-block; return nil })
 		}(i)
 	}
-
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	close(block)
 	wg.Wait()
-
-	allowed := 0
+	if started.Load() > 2 {
+		t.Fatalf("started probes=%d, want <=2", started.Load())
+	}
 	rejected := 0
 	for _, err := range errs {
-		if err == nil {
-			allowed++
-			continue
-		}
-		if errors.Is(err, ErrBreakerOpen) {
+		if errors.Is(err, ErrTooManyProbes) {
 			rejected++
 		}
 	}
-	if started.Load() > 2 {
-		t.Fatalf("started probes = %d, want <= 2", started.Load())
-	}
-	if allowed == 0 || rejected == 0 {
-		t.Fatalf("want mix of allowed/rejected calls, got allowed=%d rejected=%d", allowed, rejected)
+	if rejected == 0 {
+		t.Fatalf("expected at least one ErrTooManyProbes")
 	}
 }

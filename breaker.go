@@ -17,6 +17,7 @@ const (
 
 var (
 	ErrBreakerOpen   = errors.New("circuit breaker is open")
+	ErrTooManyProbes = errors.New("too many half-open probes")
 	ErrInvalidConfig = errors.New("invalid breaker config")
 )
 
@@ -24,6 +25,7 @@ type Config struct {
 	MaxFailures       int
 	ResetTimeout      time.Duration
 	HalfOpenMaxProbes int
+	IsFailure         func(error) bool
 }
 
 type Snapshot struct {
@@ -72,20 +74,36 @@ func (b *CircuitBreaker) State() Snapshot {
 	return Snapshot{State: b.state, Failures: b.failures}
 }
 
+func defaultIsFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	return true
+}
+
 func (b *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) error) error {
 	now := b.now()
 	probe := false
+	execState := StateClosed
+	classifier := defaultIsFailure
 
 	b.mu.Lock()
 	b.lazyTransitionLocked(now)
-	switch b.state {
+	execState = b.state
+	if b.cfg.IsFailure != nil {
+		classifier = b.cfg.IsFailure
+	}
+	switch execState {
 	case StateOpen:
 		b.mu.Unlock()
 		return ErrBreakerOpen
 	case StateHalfOpen:
 		if b.inFlightProbes >= b.cfg.HalfOpenMaxProbes {
 			b.mu.Unlock()
-			return ErrBreakerOpen
+			return ErrTooManyProbes
 		}
 		b.inFlightProbes++
 		probe = true
@@ -93,29 +111,38 @@ func (b *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) e
 	b.mu.Unlock()
 
 	err := fn(ctx)
+	isFailure := classifier(err)
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if probe {
 		b.inFlightProbes--
 	}
-
-	if err == nil {
-		if b.state == StateClosed {
-			b.failures = 0
-		} else if b.state == StateHalfOpen {
-			b.toClosedLocked()
-		}
-		return nil
+	if err != nil && !isFailure {
+		return err
 	}
 
-	switch b.state {
+	switch execState {
 	case StateClosed:
-		b.failures++
-		if b.failures >= b.cfg.MaxFailures {
-			b.toOpenLocked(b.now())
+		if err == nil {
+			if b.state == StateClosed {
+				b.failures = 0
+			}
+			return nil
+		}
+		if b.state == StateClosed {
+			b.failures++
+			if b.failures >= b.cfg.MaxFailures {
+				b.toOpenLocked(b.now())
+			}
 		}
 	case StateHalfOpen:
+		if err == nil {
+			if b.state != StateOpen {
+				b.toClosedLocked()
+			}
+			return nil
+		}
 		b.toOpenLocked(b.now())
 	}
 
@@ -131,7 +158,6 @@ func (b *CircuitBreaker) lazyTransitionLocked(now time.Time) {
 func (b *CircuitBreaker) toOpenLocked(now time.Time) {
 	b.state = StateOpen
 	b.openedAt = now
-	b.inFlightProbes = 0
 }
 
 func (b *CircuitBreaker) toClosedLocked() {
