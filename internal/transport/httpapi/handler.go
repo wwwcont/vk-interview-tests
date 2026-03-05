@@ -1,12 +1,14 @@
-// Package httpapi exposes a tiny net/http layer for the breaker demo.
+// Пакет httpapi — это тонкий HTTP-слой поверх domain-логики брекера.
 //
-// In simple words:
-// - transport layer parses JSON requests,
-// - calls application/domain behavior,
-// - maps result to HTTP status codes.
+// Простая идея слоя:
+// - принять JSON из запроса,
+// - вызвать нужный метод домена,
+// - вернуть понятный HTTP-ответ.
 //
-// This is intentionally minimal but shows clean boundaries:
-// breaker behavior is behind interface and external call simulation is also isolated.
+// Здесь специально минимум сложности:
+// - у брекера и внешнего вызова есть маленькие интерфейсы,
+// - внешний вызов можно подменять,
+// - логика статусов и ошибок лежит рядом с endpoint'ами.
 package httpapi
 
 import (
@@ -19,23 +21,22 @@ import (
 	"vk-interview-tests/internal/domain/breaker"
 )
 
-// BreakerService is a small dependency contract required by HTTP layer.
+// BreakerService — контракт, который нужен HTTP-слою от домена.
 type BreakerService interface {
 	UpdateConfig(breaker.Config) error
 	State() breaker.Snapshot
 	Execute(context.Context, func(context.Context) error) error
 }
 
-// ExternalCaller abstracts external IO call.
-// We keep it tiny so it can be replaced in tests or demos.
+// ExternalCaller — абстракция внешнего вызова (заглушка/реальный клиент).
 type ExternalCaller interface {
 	Call(context.Context, CallRequest) error
 }
 
-// SleepCaller is a simple stub: sleep, optionally fail.
+// SleepCaller — простая заглушка: ждёт delay и при необходимости падает ошибкой.
 type SleepCaller struct{}
 
-// Call simulates slow/failing downstream dependency.
+// Call имитирует внешний сервис: либо ждём delay, либо получаем timeout/cancel.
 func (SleepCaller) Call(ctx context.Context, req CallRequest) error {
 	select {
 	case <-ctx.Done():
@@ -48,26 +49,26 @@ func (SleepCaller) Call(ctx context.Context, req CallRequest) error {
 	return nil
 }
 
-// ConfigRequest is input DTO for breaker config update.
+// ConfigRequest — входной JSON для обновления конфига брекера.
 type ConfigRequest struct {
 	MaxFailures       int `json:"max_failures"`
 	ResetTimeoutMS    int `json:"reset_timeout_ms"`
 	HalfOpenMaxProbes int `json:"half_open_max_probes"`
 }
 
-// CallRequest is input DTO for protected call endpoint.
+// CallRequest — входной JSON для защищённого вызова.
 type CallRequest struct {
 	DelayMS int  `json:"delay_ms"`
 	Fail    bool `json:"fail"`
 }
 
-// App holds all dependencies used by handlers.
+// App хранит зависимости HTTP-слоя.
 type App struct {
 	breaker BreakerService
 	caller  ExternalCaller
 }
 
-// NewHandler builds and returns preconfigured ServeMux.
+// NewHandler собирает маршруты и возвращает готовый http.Handler.
 func NewHandler(b BreakerService, c ExternalCaller) http.Handler {
 	a := App{breaker: b, caller: c}
 	mux := http.NewServeMux()
@@ -77,7 +78,7 @@ func NewHandler(b BreakerService, c ExternalCaller) http.Handler {
 	return mux
 }
 
-// handleConfig parses config JSON and updates breaker config.
+// handleConfig читает JSON и обновляет runtime-конфиг брекера.
 func (a App) handleConfig(w http.ResponseWriter, r *http.Request) {
 	var req ConfigRequest
 	if json.NewDecoder(r.Body).Decode(&req) != nil {
@@ -96,12 +97,13 @@ func (a App) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleState returns current breaker snapshot.
+// handleState возвращает текущий снимок состояния брекера.
 func (a App) handleState(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, a.breaker.State())
 }
 
-// handleCall executes protected call with hard timeout 100ms.
+// handleCall выполняет внешний вызов через брекер с таймаутом 100ms.
+// Если брекер не пускает вызов — отдаём 503, иначе ошибки внешнего вызова идут как 502.
 func (a App) handleCall(w http.ResponseWriter, r *http.Request) {
 	var req CallRequest
 	if json.NewDecoder(r.Body).Decode(&req) != nil {
@@ -124,7 +126,7 @@ func (a App) handleCall(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 }
 
-// writeJSON writes response status and JSON body.
+// writeJSON — маленький helper для единообразных JSON-ответов.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

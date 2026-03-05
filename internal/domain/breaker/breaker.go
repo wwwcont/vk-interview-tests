@@ -1,20 +1,25 @@
-// Package breaker implements a very small, interview-friendly Circuit Breaker.
+// Пакет breaker реализует маленький, но практичный Circuit Breaker.
 //
-// Problem in simple words:
-// We call an external dependency (HTTP, DB, RPC). Sometimes it fails for a while.
-// If we continue sending every request there, we only make things worse:
-// slower responses, bigger queues, and more pressure on broken dependency.
+// Простыми словами о задаче:
+// мы ходим во внешний сервис (HTTP/БД/RPC), и он может временно «болеть».
+// Если в этот момент продолжать слать туда все запросы, мы только усугубляем ситуацию:
+// задержки растут, очередь растёт, и наш сервис тоже начинает деградировать.
 //
-// Circuit Breaker solves this by switching between three states:
-// 1) CLOSED: allow calls, count failures.
-// 2) OPEN: reject calls immediately for some timeout.
-// 3) HALF_OPEN: allow only a small number of probe calls to check recovery.
+// Что делает алгоритм:
+// 1) CLOSED — вызовы пропускаем, подряд идущие ошибки считаем.
+// 2) OPEN — вызовы сразу отклоняем на время reset timeout.
+// 3) HALF_OPEN — после timeout пускаем только ограниченное число «проб».
 //
-// This file keeps the algorithm intentionally compact, but production-like:
-// - thread-safe with mutex,
-// - lazy time transitions (no background goroutines/tickers),
-// - configurable failure classifier,
-// - no lock while executing user function.
+// Идея переходов:
+// - в CLOSED при достижении лимита ошибок открываем брекер;
+// - в OPEN после таймаута (лениво, на входящем запросе) переходим в HALF_OPEN;
+// - в HALF_OPEN успешная проба закрывает брекер, неуспешная снова открывает.
+//
+// Технические принципы реализации:
+// - потокобезопасность через mutex;
+// - никаких фоновых воркеров/тикеров;
+// - lock не держим во время выполнения пользовательской функции;
+// - есть настраиваемая классификация ошибок (что считать failure).
 package breaker
 
 import (
@@ -24,29 +29,29 @@ import (
 	"time"
 )
 
-// State is a readable name of current breaker mode.
+// State — текущее состояние автомата брекера в читаемом виде.
 type State string
 
 const (
-	// StateClosed means calls are allowed; failures are counted.
+	// StateClosed: штатный режим, вызовы разрешены, ошибки копятся подряд.
 	StateClosed State = "CLOSED"
-	// StateOpen means calls are rejected immediately.
+	// StateOpen: защитный режим, вызовы сразу отклоняются.
 	StateOpen State = "OPEN"
-	// StateHalfOpen means only limited probe calls are allowed.
+	// StateHalfOpen: режим проверки восстановления, разрешены только пробы.
 	StateHalfOpen State = "HALF_OPEN"
 )
 
 var (
-	// ErrBreakerOpen is returned when breaker is OPEN.
+	// ErrBreakerOpen возвращается, когда брекер в состоянии OPEN.
 	ErrBreakerOpen = errors.New("circuit breaker is open")
-	// ErrTooManyProbes is returned when HALF_OPEN probe limit is reached.
+	// ErrTooManyProbes возвращается, когда в HALF_OPEN заняты все слоты проб.
 	ErrTooManyProbes = errors.New("too many half-open probes")
-	// ErrInvalidConfig is returned for non-positive config values.
+	// ErrInvalidConfig возвращается при невалидном конфиге.
 	ErrInvalidConfig = errors.New("invalid breaker config")
 )
 
-// Config stores breaker tuning knobs.
-// IsFailure lets caller define which errors should affect breaker state.
+// Config задаёт параметры работы брекера.
+// IsFailure позволяет переопределить правило: какая ошибка влияет на брекер.
 type Config struct {
 	MaxFailures       int
 	ResetTimeout      time.Duration
@@ -54,13 +59,13 @@ type Config struct {
 	IsFailure         func(error) bool
 }
 
-// Snapshot is a small state view for APIs and logs.
+// Snapshot — лёгкий снимок состояния для API/логов.
 type Snapshot struct {
 	State    State `json:"state"`
 	Failures int   `json:"failures"`
 }
 
-// CircuitBreaker holds mutable state and synchronization primitives.
+// CircuitBreaker хранит состояние автомата и синхронизацию.
 type CircuitBreaker struct {
 	mu             sync.Mutex
 	state          State
@@ -71,7 +76,7 @@ type CircuitBreaker struct {
 	now            func() time.Time
 }
 
-// New creates breaker with CLOSED initial state and validates config.
+// New создаёт брекер в состоянии CLOSED и валидирует конфиг.
 func New(cfg Config) (*CircuitBreaker, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
@@ -79,7 +84,7 @@ func New(cfg Config) (*CircuitBreaker, error) {
 	return &CircuitBreaker{state: StateClosed, cfg: cfg, now: time.Now}, nil
 }
 
-// validateConfig checks simple positive limits.
+// validateConfig проверяет базовые ограничения конфига.
 func validateConfig(cfg Config) error {
 	if cfg.MaxFailures <= 0 || cfg.ResetTimeout <= 0 || cfg.HalfOpenMaxProbes <= 0 {
 		return ErrInvalidConfig
@@ -87,7 +92,8 @@ func validateConfig(cfg Config) error {
 	return nil
 }
 
-// UpdateConfig replaces runtime config after validation.
+// UpdateConfig обновляет конфиг во время работы.
+// Если входной конфиг невалидный — возвращает ошибку.
 func (b *CircuitBreaker) UpdateConfig(cfg Config) error {
 	if err := validateConfig(cfg); err != nil {
 		return err
@@ -98,8 +104,8 @@ func (b *CircuitBreaker) UpdateConfig(cfg Config) error {
 	return nil
 }
 
-// State returns current state and failure counter.
-// It also performs lazy OPEN -> HALF_OPEN transition if timeout passed.
+// State возвращает текущее состояние и число подряд ошибок.
+// Здесь же лениво применяем переход OPEN -> HALF_OPEN по времени.
 func (b *CircuitBreaker) State() Snapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -107,10 +113,11 @@ func (b *CircuitBreaker) State() Snapshot {
 	return Snapshot{State: b.state, Failures: b.failures}
 }
 
-// defaultIsFailure defines default classification:
-// - nil => not failure
-// - context.Canceled => not failure
-// - everything else => failure (including DeadlineExceeded)
+// defaultIsFailure — дефолтная классификация ошибок.
+// Правило простое:
+// - nil: не ошибка;
+// - context.Canceled: нейтрально, на брекер не влияет;
+// - всё остальное (включая DeadlineExceeded): считаем failure.
 func defaultIsFailure(err error) bool {
 	if err == nil {
 		return false
@@ -121,8 +128,8 @@ func defaultIsFailure(err error) bool {
 	return true
 }
 
-// Execute runs protected function through breaker algorithm.
-// Important concurrency rule: lock is released before fn(ctx) execution.
+// Execute запускает защищаемую функцию через брекер.
+// Важный момент: mutex отпускается до вызова fn(ctx), чтобы не блокировать систему.
 func (b *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) error) error {
 	now := b.now()
 	probe := false
@@ -190,20 +197,21 @@ func (b *CircuitBreaker) Execute(ctx context.Context, fn func(context.Context) e
 	return err
 }
 
-// lazyTransitionLocked moves OPEN to HALF_OPEN after timeout.
+// lazyTransitionLocked переводит OPEN в HALF_OPEN,
+// если прошло достаточно времени с момента открытия.
 func (b *CircuitBreaker) lazyTransitionLocked(now time.Time) {
 	if b.state == StateOpen && now.Sub(b.openedAt) >= b.cfg.ResetTimeout {
 		b.state = StateHalfOpen
 	}
 }
 
-// toOpenLocked switches to OPEN and records open timestamp.
+// toOpenLocked переводит брекер в OPEN и запоминает время открытия.
 func (b *CircuitBreaker) toOpenLocked(now time.Time) {
 	b.state = StateOpen
 	b.openedAt = now
 }
 
-// toClosedLocked switches to CLOSED and clears counters.
+// toClosedLocked переводит брекер в CLOSED и сбрасывает счётчики.
 func (b *CircuitBreaker) toClosedLocked() {
 	b.state = StateClosed
 	b.failures = 0

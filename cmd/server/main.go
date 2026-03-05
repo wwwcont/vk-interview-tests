@@ -1,9 +1,9 @@
-// Binary server starts the demo HTTP API around the circuit breaker.
+// Пакет main поднимает демо HTTP API вокруг circuit breaker.
 //
-// Very simple flow:
-// 1) create breaker with default config,
-// 2) compose HTTP handler,
-// 3) listen on :8080.
+// Логика очень простая:
+// 1) создаём брекер с дефолтным конфигом,
+// 2) собираем HTTP-обработчики,
+// 3) слушаем порт :8080.
 package main
 
 import (
@@ -15,7 +15,7 @@ import (
 	"vk-interview-tests/internal/transport/httpapi"
 )
 
-// main is a tiny composition root for the demo service.
+// main — минимальная точка сборки приложения.
 func main() {
 	b, err := breaker.New(breaker.Config{MaxFailures: 3, ResetTimeout: time.Second, HalfOpenMaxProbes: 1})
 	if err != nil {
