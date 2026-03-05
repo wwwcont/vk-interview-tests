@@ -1,4 +1,4 @@
-// Package breaker Пакет breaker реализует маленький, но практичный Circuit Breaker.
+// Package breaker реализует ПРИМЕР маленького, но практичного Circuit Breaker.
 //
 // Технические принципы реализации:
 // - потокобезопасность через mutex;
