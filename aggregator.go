@@ -9,18 +9,21 @@ import (
 	"time"
 )
 
+// Event — входное событие потока.
 type Event struct {
 	Key   string
 	Value int64
 	Ts    time.Time
 }
 
+// Aggregate — агрегат по паре (WindowStart, Key).
 type Aggregate struct {
 	WindowStart time.Time
 	Key         string
 	Sum         int64
 }
 
+// Repo — внешнее хранилище агрегатов.
 type Repo interface {
 	SaveBatch(ctx context.Context, aggs []Aggregate) error
 }
@@ -28,30 +31,42 @@ type Repo interface {
 var ErrQueueFull = errors.New("queue full")
 var ErrClosed = errors.New("aggregator closed")
 
+// Aggregator — контракт сервиса.
 type Aggregator interface {
 	Add(e Event) error
 	Flush(ctx context.Context) error
 	Close(ctx context.Context) error
 }
 
+// Config — минимальные настройки.
 type Config struct {
-	WindowSize time.Duration
-	QueueCap   int
+	WindowSize    time.Duration
+	QueueCap      int
+	FlushInterval time.Duration
+	MaxKeys       int
 }
 
+// Service — простой потокобезопасный агрегатор с одним воркером.
 type Service struct {
 	repo       Repo
 	windowSize time.Duration
-	queue      chan request
-	closed     atomic.Bool
-	closeOnce  sync.Once
-	done       chan struct{}
+	maxKeys    int
+
+	// eventCh ограничивает скорость Add (backpressure).
+	eventCh chan request
+	// flushCh отдельный канал для приоритетного Flush.
+	flushCh chan *flushReq
+
+	closed    atomic.Bool
+	closeOnce sync.Once
+	stopCh    chan struct{}
+	done      chan struct{}
 }
 
+// request хранит Event значением (без *Event), чтобы избежать лишней escape-аллокации.
 type request struct {
-	event *Event
-	flush *flushReq
-	stop  chan struct{}
+	hasEvent bool
+	event    Event
 }
 
 type flushReq struct {
@@ -77,19 +92,23 @@ func New(repo Repo, cfg Config) (*Service, error) {
 	s := &Service{
 		repo:       repo,
 		windowSize: cfg.WindowSize,
-		queue:      make(chan request, cfg.QueueCap),
+		maxKeys:    cfg.MaxKeys,
+		eventCh:    make(chan request, cfg.QueueCap),
+		flushCh:    make(chan *flushReq, 8),
+		stopCh:     make(chan struct{}),
 		done:       make(chan struct{}),
 	}
-	go s.worker()
+	go s.worker(cfg.FlushInterval)
 	return s, nil
 }
 
+// Add неблокирующе пишет событие в bounded-очередь.
 func (s *Service) Add(e Event) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
 	select {
-	case s.queue <- request{event: &e}:
+	case s.eventCh <- request{hasEvent: true, event: e}:
 		return nil
 	default:
 		if s.closed.Load() {
@@ -99,62 +118,97 @@ func (s *Service) Add(e Event) error {
 	}
 }
 
+// Flush отправляет приоритетный запрос на flush и ждёт результат.
 func (s *Service) Flush(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	resp := make(chan error, 1)
-	req := request{flush: &flushReq{ctx: ctx, errC: resp}}
+	fr := &flushReq{ctx: ctx, errC: make(chan error, 1)}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.done:
 		return ErrClosed
-	case s.queue <- req:
+	case s.flushCh <- fr:
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case err := <-resp:
+	case err := <-fr.errC:
 		return err
 	}
 }
 
+// Close запрещает новые Add, делает финальный flush и останавливает воркер.
 func (s *Service) Close(ctx context.Context) error {
 	flushErr := error(nil)
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		flushErr = s.Flush(ctx)
-		stop := make(chan struct{})
-		s.queue <- request{stop: stop}
-		<-stop
+		close(s.stopCh)
 		<-s.done
 	})
 	return flushErr
 }
 
-func (s *Service) worker() {
+// worker — единственная горутина, которая владеет state.
+// Поэтому глобальные mutex не нужны, и мы не держим lock во время I/O.
+func (s *Service) worker(flushInterval time.Duration) {
 	defer close(s.done)
 	state := make(map[aggKey]int64)
+
+	var ticker *time.Ticker
+	var tickerC <-chan time.Time
+	if flushInterval > 0 {
+		ticker = time.NewTicker(flushInterval)
+		tickerC = ticker.C
+		defer ticker.Stop()
+	}
+
 	for {
-		req := <-s.queue
-		switch {
-		case req.event != nil:
+		// 1) Приоритетно вычитываем все pending flush-запросы.
+		for {
+			select {
+			case fr := <-s.flushCh:
+				fr.errC <- s.flushState(fr.ctx, state)
+			default:
+				goto mainLoop
+			}
+		}
+
+	mainLoop:
+		// 2) Обычная обработка: stop/flush/event/ticker.
+		select {
+		case <-s.stopCh:
+			return
+		case fr := <-s.flushCh:
+			fr.errC <- s.flushState(fr.ctx, state)
+		case req := <-s.eventCh:
+			if !req.hasEvent {
+				continue
+			}
 			e := req.event
 			k := aggKey{windowStart: e.Ts.Truncate(s.windowSize), key: e.Key}
 			state[k] += e.Value
-		case req.flush != nil:
-			err := s.flushState(req.flush.ctx, state)
-			req.flush.errC <- err
-		case req.stop != nil:
-			close(req.stop)
-			return
-		default:
-			panic("invalid request")
+			// Порог по ключам: best-effort auto-flush, чтобы не разрасталось состояние.
+			if s.maxKeys > 0 && len(state) >= s.maxKeys {
+				s.autoFlush(state)
+			}
+		case <-tickerC:
+			// Периодический auto-flush (если включен).
+			s.autoFlush(state)
 		}
 	}
 }
 
+// autoFlush с коротким таймаутом, чтобы воркер не зависал навсегда на I/O.
+func (s *Service) autoFlush(state map[aggKey]int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_ = s.flushState(ctx, state)
+}
+
+// flushState формирует снимок, очищает state, пишет батч и при ошибке возвращает данные обратно.
 func (s *Service) flushState(ctx context.Context, state map[aggKey]int64) error {
 	if len(state) == 0 {
 		return nil
