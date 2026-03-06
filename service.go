@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -223,8 +222,16 @@ func (s *CounterService) runAutoFlush(interval time.Duration) {
 }
 
 // shardIndex детерминированно относит id к конкретному шарду.
+// Для hot-path используем «ручной» FNV-1a без аллокаций и интерфейсных вызовов.
 func (s *CounterService) shardIndex(id string) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(id))
-	return h.Sum32() % uint32(len(s.shards))
+	const (
+		fnvOffset32 = 2166136261
+		fnvPrime32  = 16777619
+	)
+	h := uint32(fnvOffset32)
+	for i := 0; i < len(id); i++ {
+		h ^= uint32(id[i])
+		h *= fnvPrime32
+	}
+	return h % uint32(len(s.shards))
 }
