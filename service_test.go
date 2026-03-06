@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+// mockRepo — простой потокобезопасный in-memory репозиторий для тестов.
+// Никаких внешних библиотек: только map+mutex+несколько вспомогательных хуков.
 type mockRepo struct {
 	mu sync.Mutex
 	m  map[string]int64
@@ -16,6 +18,8 @@ type mockRepo struct {
 	addCalls int64
 	addCh    chan struct{}
 
+	// failFirst заставляет первый AddBatch вернуть ошибку,
+	// чтобы проверить rollback логики в сервисе.
 	failFirst atomic.Bool
 }
 
@@ -30,14 +34,18 @@ func (r *mockRepo) AddBatch(_ context.Context, deltas map[string]int64) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	for id, delta := range deltas {
 		r.m[id] += delta
 	}
 	atomic.AddInt64(&r.addCalls, 1)
+
+	// Сигнализируем тестам, что AddBatch был вызван.
 	select {
 	case r.addCh <- struct{}{}:
 	default:
 	}
+
 	return nil
 }
 
@@ -51,6 +59,7 @@ func (r *mockRepo) addCount() int64 {
 	return atomic.LoadInt64(&r.addCalls)
 }
 
+// Проверяем, что Get учитывает pending-дельту до flush.
 func TestIncrAndGet_PendingIncluded(t *testing.T) {
 	repo := newMockRepo()
 	svc, err := New(repo, Config{Shards: 8})
@@ -71,6 +80,7 @@ func TestIncrAndGet_PendingIncluded(t *testing.T) {
 	}
 }
 
+// Проверяем, что flush пишет в repo и очищает pending-состояние.
 func TestFlush_WritesToRepoAndClearsPending(t *testing.T) {
 	repo := newMockRepo()
 	svc, err := New(repo, Config{Shards: 16})
@@ -102,6 +112,8 @@ func TestFlush_WritesToRepoAndClearsPending(t *testing.T) {
 	}
 }
 
+// Проверяем, что при ошибке AddBatch данные не теряются
+// и при следующем успешном flush записываются ровно один раз.
 func TestFlush_ErrorDoesNotLoseData(t *testing.T) {
 	repo := newMockRepo()
 	repo.failFirst.Store(true)
@@ -130,6 +142,8 @@ func TestFlush_ErrorDoesNotLoseData(t *testing.T) {
 	}
 }
 
+// Нагрузочный сценарий: много goroutine одновременно инкрементят
+// один общий id и набор разных id.
 func TestConcurrentIncr(t *testing.T) {
 	repo := newMockRepo()
 	svc, err := New(repo, Config{Shards: 32})
@@ -140,6 +154,7 @@ func TestConcurrentIncr(t *testing.T) {
 
 	const goroutines = 24
 	const loops = 2000
+
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
 	for g := 0; g < goroutines; g++ {
@@ -173,6 +188,7 @@ func TestConcurrentIncr(t *testing.T) {
 	}
 }
 
+// Проверяем, что авто-flush действительно срабатывает по таймеру.
 func TestAutoFlush(t *testing.T) {
 	repo := newMockRepo()
 	svc, err := New(repo, Config{Shards: 8, FlushInterval: 20 * time.Millisecond})
@@ -195,6 +211,11 @@ func TestAutoFlush(t *testing.T) {
 	}
 }
 
+// Проверяем поведение Close:
+// - финальный flush выполняется,
+// - повторный Close безопасен,
+// - после Close новые записи не отправляются,
+// - ручной Flush возвращает ErrClosed.
 func TestClose_FlushesAndStops(t *testing.T) {
 	repo := newMockRepo()
 	svc, err := New(repo, Config{Shards: 8, FlushInterval: 15 * time.Millisecond})
