@@ -33,10 +33,15 @@ type Service interface {
 // ErrClosed возвращается из Flush после закрытия сервиса.
 var ErrClosed = errors.New("service closed")
 
+const defaultFlushTimeout = 100 * time.Millisecond
+
 // Config задает параметры шардирования и авто-сброса.
 type Config struct {
 	Shards        int
 	FlushInterval time.Duration
+	// FlushTimeout применим только к background auto-flush.
+	// Для ручного Flush используется ctx, переданный вызывающим кодом.
+	FlushTimeout time.Duration
 }
 
 // shard — изолированный сегмент in-memory буфера.
@@ -46,14 +51,21 @@ type shard struct {
 	m  map[string]int64
 }
 
+// flushCall представляет один «полет» flush.
+// Нужен для coalescing: параллельные Flush ждут done и получают тот же err.
+type flushCall struct {
+	done chan struct{}
+	err  error
+}
+
 // CounterService — потокобезопасный счетчик с буферизацией и батчевым Flush.
 type CounterService struct {
 	repo   Repo
 	shards []shard
 
-	// flushMu сериализует flush-пути (ручной, авто и финальный Close),
-	// чтобы одновременно не выполнялось несколько AddBatch.
-	flushMu sync.Mutex
+	// flushStateMu защищает coalescing-состояние inFlight.
+	flushStateMu sync.Mutex
+	inFlight     *flushCall
 
 	// closed блокирует новые Incr и ручные Flush после Close.
 	closed atomic.Bool
@@ -63,6 +75,8 @@ type CounterService struct {
 	// stopCh/doneCh управляют жизненным циклом фоновой goroutine авто-flush.
 	stopCh chan struct{}
 	doneCh chan struct{}
+
+	autoFlushTimeout time.Duration
 }
 
 // New создает сервис, валидирует конфиг и (опционально) запускает auto-flush.
@@ -74,11 +88,17 @@ func New(repo Repo, cfg Config) (*CounterService, error) {
 		return nil, fmt.Errorf("invalid shards: %d", cfg.Shards)
 	}
 
+	flushTimeout := cfg.FlushTimeout
+	if flushTimeout <= 0 {
+		flushTimeout = defaultFlushTimeout
+	}
+
 	s := &CounterService{
-		repo:   repo,
-		shards: make([]shard, cfg.Shards),
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+		repo:             repo,
+		shards:           make([]shard, cfg.Shards),
+		stopCh:           make(chan struct{}),
+		doneCh:           make(chan struct{}),
+		autoFlushTimeout: flushTimeout,
 	}
 	for i := range s.shards {
 		s.shards[i].m = make(map[string]int64)
@@ -132,15 +152,36 @@ func (s *CounterService) Flush(ctx context.Context) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
-	return s.flush(ctx)
+	return s.runFlush(ctx)
 }
 
-// flush — внутренняя версия без проверки closed.
-// Нужна, чтобы Close мог выполнить финальный сброс после выставления closed=true.
-func (s *CounterService) flush(ctx context.Context) error {
-	s.flushMu.Lock()
-	defer s.flushMu.Unlock()
+// runFlush реализует coalescing:
+// - первый caller становится лидером и делает реальный flush;
+// - остальные ждут завершения текущего flush и получают тот же результат.
+func (s *CounterService) runFlush(ctx context.Context) error {
+	s.flushStateMu.Lock()
+	if call := s.inFlight; call != nil {
+		s.flushStateMu.Unlock()
+		<-call.done
+		return call.err
+	}
+	call := &flushCall{done: make(chan struct{})}
+	s.inFlight = call
+	s.flushStateMu.Unlock()
 
+	call.err = s.flushOnce(ctx)
+	close(call.done)
+
+	s.flushStateMu.Lock()
+	if s.inFlight == call {
+		s.inFlight = nil
+	}
+	s.flushStateMu.Unlock()
+	return call.err
+}
+
+// flushOnce — фактический flush с snapshot+swap и rollback при ошибке Repo.AddBatch.
+func (s *CounterService) flushOnce(ctx context.Context) error {
 	// snapshots хранит «снятые» карты по шардам.
 	// batch — агрегированная карта для одного вызова Repo.AddBatch.
 	snapshots := make([]map[string]int64, len(s.shards))
@@ -197,12 +238,13 @@ func (s *CounterService) Close(ctx context.Context) error {
 		s.closed.Store(true)
 		close(s.stopCh)
 		<-s.doneCh
-		err = s.flush(ctx)
+		err = s.runFlush(ctx)
 	})
 	return err
 }
 
 // runAutoFlush периодически запускает flush до получения stop-сигнала.
+// Каждый авто-flush ограничен timeout, чтобы не зависнуть на долгом AddBatch.
 func (s *CounterService) runAutoFlush(interval time.Duration) {
 	defer close(s.doneCh)
 
@@ -210,11 +252,18 @@ func (s *CounterService) runAutoFlush(interval time.Duration) {
 	defer ticker.Stop()
 
 	for {
+		// Быстрый выход при закрытии: не запускаем лишний flush после stop-сигнала.
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+
 		select {
 		case <-ticker.C:
-			// Ошибку авто-flush намеренно игнорируем:
-			// данные откатятся обратно в память и могут быть сброшены позже.
-			_ = s.flush(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), s.autoFlushTimeout)
+			_ = s.runFlush(ctx)
+			cancel()
 		case <-s.stopCh:
 			return
 		}
